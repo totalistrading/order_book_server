@@ -46,11 +46,11 @@ pub(super) async fn process_rmp_file(dir: &Path) -> Result<PathBuf> {
 
 pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
     snapshot: &Snapshots<O>,
-    expected: Snapshots<O>,
+    expected: &Snapshots<O>,
     ignore_spot: bool,
 ) -> Result<()> {
     let mut snapshot_map: HashMap<_, _> =
-        expected.value().into_iter().filter(|(c, _)| !c.is_spot() || !ignore_spot).collect();
+        expected.as_ref().iter().filter(|(c, _)| !c.is_spot() || !ignore_spot).collect();
 
     for (coin, book) in snapshot.as_ref() {
         if ignore_spot && coin.is_spot() {
@@ -58,6 +58,9 @@ pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
         }
         let book1 = book.as_ref();
         if let Some(book2) = snapshot_map.remove(coin) {
+            if book1.iter().map(Vec::len).ne(book2.as_ref().iter().map(Vec::len)) {
+                return Err(format!("Order counts do not match for {}", coin.value()).into());
+            }
             for (orders1, orders2) in book1.as_ref().iter().zip(book2.as_ref()) {
                 for (order1, order2) in orders1.iter().zip(orders2.iter()) {
                     if *order1 != *order2 {

@@ -14,7 +14,7 @@ use crate::{
 };
 use alloy::primitives::Address;
 use fs::File;
-use log::{error, info};
+use log::{error, info, warn};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use std::{
     cmp::Ordering,
@@ -55,11 +55,6 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
             error!("Error sending fs event to processor via channel: {err}");
         }
     })?;
-
-    let ignore_spot = {
-        let listener = listener.lock().await;
-        listener.ignore_spot
-    };
 
     // every so often, we fetch a new snapshot and the snapshot_fetch_task starts running.
     // Result is sent back along this channel (if error, we want to return to top level)
@@ -120,7 +115,7 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
             _ = ticker.tick() => {
                 let listener = listener.clone();
                 let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
-                fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
+                fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx);
             }
             () = sleep(Duration::from_secs(5)) => {
                 let listener = listener.lock().await;
@@ -132,12 +127,7 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     }
 }
 
-fn fetch_snapshot(
-    dir: PathBuf,
-    listener: Arc<Mutex<OrderBookListener>>,
-    tx: UnboundedSender<Result<()>>,
-    ignore_spot: bool,
-) {
+fn fetch_snapshot(dir: PathBuf, listener: Arc<Mutex<OrderBookListener>>, tx: UnboundedSender<Result<()>>) {
     let tx = tx.clone();
     tokio::spawn(async move {
         let res = match process_rmp_file(&dir).await {
@@ -151,39 +141,22 @@ fn fetch_snapshot(
                 info!("Snapshot fetched");
                 // sleep to let some updates build up.
                 sleep(Duration::from_secs(1)).await;
-                let mut cache = {
-                    let mut listener = listener.lock().await;
-                    listener.take_cache()
-                };
-                info!("Cache has {} elements", cache.len());
                 match snapshot {
                     Ok((height, expected_snapshot)) => {
-                        if let Some(mut state) = state {
-                            while state.height() < height {
-                                if let Some((order_statuses, order_diffs)) = cache.pop_front() {
-                                    state.apply_updates(order_statuses, order_diffs)?;
-                                } else {
-                                    return Err::<(), Error>("Not enough cached updates".into());
-                                }
-                            }
-                            if state.height() > height {
-                                return Err("Fetched snapshot lagging stored state".into());
-                            }
-                            let stored_snapshot = state.compute_snapshot().snapshot;
-                            info!("Validating snapshot");
-                            validate_snapshot_consistency(&stored_snapshot, expected_snapshot, ignore_spot)
-                        } else {
-                            listener.lock().await.init_from_snapshot(expected_snapshot, height);
-                            Ok(())
-                        }
+                        let mut listener = listener.lock().await;
+                        let cache = listener.take_cache();
+                        info!("Cache has {} elements", cache.len());
+                        listener.reconcile_snapshot(state, expected_snapshot, height, cache)
                     }
-                    Err(err) => Err(err),
+                    Err(err) => {
+                        listener.lock().await.take_cache();
+                        Err(err)
+                    }
                 }
             }
             Err(err) => Err(err),
         };
         let _unused = tx.send(res);
-        Ok(())
     });
 }
 
@@ -328,6 +301,44 @@ impl OrderBookListener {
             self.order_book_state = Some(new_order_book);
             info!("Order book ready");
         }
+    }
+
+    fn reconcile_snapshot(
+        &mut self,
+        state: Option<OrderBookState>,
+        expected_snapshot: Snapshots<InnerL4Order>,
+        height: u64,
+        mut cache: VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)>,
+    ) -> Result<()> {
+        let Some(mut state) = state else {
+            self.init_from_snapshot(expected_snapshot, height);
+            return Ok(());
+        };
+
+        while state.height() < height {
+            if let Some((order_statuses, order_diffs)) = cache.pop_front() {
+                state.apply_updates(order_statuses, order_diffs)?;
+            } else {
+                return Err("Not enough cached updates".into());
+            }
+        }
+        if state.height() > height {
+            return Err("Fetched snapshot lagging stored state".into());
+        }
+
+        info!("Validating snapshot");
+        if let Err(err) =
+            validate_snapshot_consistency(&state.compute_snapshot().snapshot, &expected_snapshot, self.ignore_spot)
+        {
+            warn!("Snapshot diverged ({err}); reloading authoritative node snapshot");
+            let mut recovered = OrderBookState::from_snapshot(expected_snapshot, height, 0, true, self.ignore_spot);
+            while let Some((order_statuses, order_diffs)) = cache.pop_front() {
+                recovered.apply_updates(order_statuses, order_diffs)?;
+            }
+            self.order_book_state = Some(recovered);
+            info!("Order book recovered from node snapshot");
+        }
+        Ok(())
     }
 
     // forcibly grab current snapshot
@@ -478,4 +489,24 @@ pub(crate) enum InternalMessage {
 pub(crate) struct L2SnapshotParams {
     n_sig_figs: Option<u32>,
     mantissa: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::order_book::multi_book::load_snapshots_from_str;
+
+    #[test]
+    fn reloads_snapshot_when_a_market_is_added() -> Result<()> {
+        let mut listener = OrderBookListener::new(None, false);
+        listener.order_book_state =
+            Some(OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 100, 0, true, false));
+        let (_, expected) =
+            load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(r#"[100, [["NEW", [[], []]]]]"#)?;
+
+        listener.reconcile_snapshot(listener.clone_state(), expected, 100, VecDeque::new())?;
+
+        assert!(listener.universe().contains(&Coin::new("NEW")));
+        Ok(())
+    }
 }
