@@ -350,6 +350,19 @@ impl Subscription {
         &self,
         listener: Arc<Mutex<OrderBookListener>>,
     ) -> Result<Option<ServerResponse>> {
+        if let Self::L2Book { coin, n_sig_figs, n_levels, mantissa } = self {
+            if let Some((time, snapshots)) = listener.lock().await.compute_l2_snapshot() {
+                if let Some(snapshot) = snapshots
+                    .as_ref()
+                    .get(&Coin::new(coin))
+                    .and_then(|value| value.get(&L2SnapshotParams::new(*n_sig_figs, *mantissa)))
+                {
+                    let levels = snapshot.truncate(n_levels.unwrap_or(DEFAULT_LEVELS)).export_inner_snapshot();
+                    return Ok(Some(ServerResponse::L2Book(L2Book::from_l2_snapshot(coin.clone(), levels, time))));
+                }
+            }
+            return Err("Snapshot Failed".into());
+        }
         if let Self::L4Book { coin } = self {
             let snapshot = listener.lock().await.compute_snapshot();
             if let Some(TimedSnapshots { time, height, snapshot }) = snapshot {

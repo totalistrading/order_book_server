@@ -335,6 +335,10 @@ impl OrderBookListener {
         self.order_book_state.as_mut().map(|o| o.compute_snapshot())
     }
 
+    pub(crate) fn compute_l2_snapshot(&self) -> Option<(u64, L2Snapshots)> {
+        self.order_book_state.as_ref().map(|o| o.compute_l2_snapshot())
+    }
+
     // prevent snapshotting mutiple times at the same height
     fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, L2Snapshots)> {
         self.order_book_state.as_mut().and_then(|o| o.l2_snapshots(prevent_future_snaps))
