@@ -323,7 +323,8 @@ impl OrderBookListener {
             }
         }
         if state.height() > height {
-            return Err("Fetched snapshot lagging stored state".into());
+            warn!("Fetched snapshot at height {height} lags stored state at {}; skipping validation", state.height());
+            return Ok(());
         }
 
         info!("Validating snapshot");
@@ -507,6 +508,18 @@ mod tests {
         listener.reconcile_snapshot(listener.clone_state(), expected, 100, VecDeque::new())?;
 
         assert!(listener.universe().contains(&Coin::new("NEW")));
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_snapshot_older_than_live_state() -> Result<()> {
+        let mut listener = OrderBookListener::new(None, false);
+        listener.order_book_state =
+            Some(OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 101, 0, true, false));
+
+        listener.reconcile_snapshot(listener.clone_state(), Snapshots::new(HashMap::new()), 100, VecDeque::new())?;
+
+        assert!(listener.is_ready());
         Ok(())
     }
 }
