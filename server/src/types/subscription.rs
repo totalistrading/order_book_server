@@ -6,6 +6,10 @@ use std::collections::HashSet;
 const MAX_LEVELS: usize = 100;
 pub(crate) const DEFAULT_LEVELS: usize = 20;
 
+pub(crate) fn is_hip4_coin(coin: &str) -> bool {
+    coin.strip_prefix('#').is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method")]
 #[serde(rename_all = "camelCase")]
@@ -29,9 +33,9 @@ pub(crate) enum Subscription {
 impl Subscription {
     pub(crate) fn validate(&self, universe: &HashSet<String>) -> bool {
         match self {
-            Self::Trades { coin } => universe.contains(coin),
+            Self::Trades { coin } => universe.contains(coin) || is_hip4_coin(coin),
             Self::L2Book { coin, n_sig_figs, n_levels, mantissa } => {
-                if !universe.contains(coin) || coin.starts_with('@') {
+                if !universe.contains(coin) && !is_hip4_coin(coin) {
                     info!("Invalid subscription: coin not found");
                     return false;
                 }
@@ -105,7 +109,9 @@ impl SubscriptionManager {
 
 #[cfg(test)]
 mod test {
-    use crate::types::subscription::Subscription;
+    use std::collections::HashSet;
+
+    use crate::types::subscription::{Subscription, is_hip4_coin};
 
     use super::{ClientMessage, ServerResponse};
 
@@ -148,5 +154,18 @@ mod test {
                 subscription: Subscription::L2Book { n_sig_figs: None, n_levels: None, mantissa: None, .. },
             }
         ));
+    }
+
+    #[test]
+    fn accepts_valid_hip4_coins_before_their_first_order() {
+        let universe = HashSet::new();
+        assert!(is_hip4_coin("#154170"));
+        assert!(!is_hip4_coin("#"));
+        assert!(!is_hip4_coin("#BTC"));
+        assert!(Subscription::Trades { coin: "#154170".to_string() }.validate(&universe));
+        assert!(
+            Subscription::L2Book { coin: "#154170".to_string(), n_sig_figs: None, n_levels: Some(100), mantissa: None }
+                .validate(&universe)
+        );
     }
 }

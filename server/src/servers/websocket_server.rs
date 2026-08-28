@@ -8,7 +8,9 @@ use crate::{
         L2Book, L4Book, L4BookUpdates, L4Order, Trade,
         inner::InnerLevel,
         node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
-        subscription::{ClientMessage, DEFAULT_LEVELS, ServerResponse, Subscription, SubscriptionManager},
+        subscription::{
+            ClientMessage, DEFAULT_LEVELS, ServerResponse, Subscription, SubscriptionManager, is_hip4_coin,
+        },
     },
 };
 use axum::{Router, response::IntoResponse, routing::get};
@@ -359,6 +361,13 @@ impl Subscription {
                 {
                     let levels = snapshot.truncate(n_levels.unwrap_or(DEFAULT_LEVELS)).export_inner_snapshot();
                     return Ok(Some(ServerResponse::L2Book(L2Book::from_l2_snapshot(coin.clone(), levels, time))));
+                }
+                if is_hip4_coin(coin) {
+                    return Ok(Some(ServerResponse::L2Book(L2Book::from_l2_snapshot(
+                        coin.clone(),
+                        [Vec::new(), Vec::new()],
+                        time,
+                    ))));
                 }
             }
             return Err("Snapshot Failed".into());
