@@ -57,22 +57,22 @@ impl L2Book {
 }
 
 impl Trade {
-    #[allow(clippy::unwrap_used)]
-    pub(crate) fn from_fills(mut fills: HashMap<Side, NodeDataFill>) -> Self {
-        let NodeDataFill(seller, ask_fill) = fills.remove(&Side::Ask).unwrap();
-        let NodeDataFill(buyer, bid_fill) = fills.remove(&Side::Bid).unwrap();
+    pub(crate) fn from_fills(mut fills: HashMap<Side, NodeDataFill>) -> Option<Self> {
+        let NodeDataFill(seller, ask_fill) = fills.remove(&Side::Ask)?;
+        let NodeDataFill(buyer, bid_fill) = fills.remove(&Side::Bid)?;
+        if ask_fill.coin != bid_fill.coin || ask_fill.tid != bid_fill.tid {
+            return None;
+        }
         let ask_is_taker = ask_fill.crossed;
         let side = if ask_is_taker { Side::Ask } else { Side::Bid };
         let coin = ask_fill.coin.clone();
-        assert_eq!(coin, bid_fill.coin);
         let tid = ask_fill.tid;
-        assert_eq!(tid, bid_fill.tid);
         let px = ask_fill.px;
         let sz = ask_fill.sz;
         let hash = ask_fill.hash;
         let time = ask_fill.time;
         let users = [buyer, seller];
-        Self { coin, side, px, sz, hash, time, tid, users }
+        Some(Self { coin, side, px, sz, hash, time, tid, users })
     }
 }
 
@@ -185,5 +185,10 @@ mod tests {
         };
         assert_eq!(*insert_before, Some(105_338_503_859));
         assert_eq!(serde_json::to_string(&diff).unwrap(), with_anchor);
+    }
+
+    #[test]
+    fn incomplete_fill_pair_is_ignored() {
+        assert!(Trade::from_fills(HashMap::new()).is_none());
     }
 }

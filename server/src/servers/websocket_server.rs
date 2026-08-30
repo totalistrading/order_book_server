@@ -288,9 +288,10 @@ fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
                 let mut fills = HashMap::new();
                 fills.insert(f1.1.side, f1);
                 fills.insert(f2.1.side, f2);
-                let trade = Trade::from_fills(fills);
-                let coin = trade.coin.clone();
-                trades.entry(coin).or_insert_with(Vec::new).push(trade);
+                if let Some(trade) = Trade::from_fills(fills) {
+                    let coin = trade.coin.clone();
+                    trades.entry(coin).or_insert_with(Vec::new).push(trade);
+                }
             }
         }
     }

@@ -412,7 +412,6 @@ impl DirectoryListener for OrderBookListener {
     }
 
     fn process_data(&mut self, data: String, event_source: EventSource) -> Result<()> {
-        let total_len = data.len();
         let lines = data.lines();
         for line in lines {
             if line.is_empty() {
@@ -437,9 +436,8 @@ impl DirectoryListener for OrderBookListener {
                         self.order_book_state.as_ref().map(OrderBookState::height),
                         &line[..100],
                     );
-                    #[allow(clippy::unwrap_used)]
-                    let total_len: i64 = total_len.try_into().unwrap();
-                    self.file_mut(event_source).as_mut().map(|f| f.seek_relative(-total_len));
+                    let unread = i64::try_from(line.len())?;
+                    self.file_mut(event_source).as_mut().map(|f| f.seek_relative(-unread));
                     break;
                 }
             };
@@ -520,6 +518,24 @@ mod tests {
         listener.reconcile_snapshot(listener.clone_state(), Snapshots::new(HashMap::new()), 100, VecDeque::new())?;
 
         assert!(listener.is_ready());
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_record_rewinds_only_that_record() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("order-book-partial-{}", std::process::id()));
+        let data = format!("\n{{\"value\":\"{}", "x".repeat(120));
+        fs::write(&path, &data)?;
+        let mut file = File::open(&path)?;
+        file.seek(SeekFrom::End(0))?;
+        let mut listener = OrderBookListener::new(None, false);
+        listener.order_status_file = Some(file);
+
+        listener.process_data(data, EventSource::OrderStatuses)?;
+
+        let position = listener.order_status_file.as_mut().unwrap().stream_position()?;
+        fs::remove_file(path)?;
+        assert_eq!(position, 1);
         Ok(())
     }
 }
