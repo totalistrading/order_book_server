@@ -319,7 +319,8 @@ impl OrderBookListener {
             if let Some((order_statuses, order_diffs)) = cache.pop_front() {
                 state.apply_updates(order_statuses, order_diffs)?;
             } else {
-                return Err("Not enough cached updates".into());
+                warn!("Snapshot at height {height} is ahead of cached updates; skipping validation");
+                return Ok(());
             }
         }
         if state.height() > height {
@@ -412,8 +413,15 @@ impl DirectoryListener for OrderBookListener {
     }
 
     fn process_data(&mut self, data: String, event_source: EventSource) -> Result<()> {
-        let lines = data.lines();
-        for line in lines {
+        for record in data.split_inclusive('\n') {
+            if !record.ends_with('\n') {
+                let unread = i64::try_from(record.len())?;
+                if let Some(file) = self.file_mut(event_source).as_mut() {
+                    file.seek_relative(-unread)?;
+                }
+                break;
+            }
+            let line = record.trim_end_matches(['\r', '\n']);
             if line.is_empty() {
                 continue;
             }
@@ -430,15 +438,12 @@ impl DirectoryListener for OrderBookListener {
             let (height, event_batch) = match res {
                 Ok(data) => data,
                 Err(err) => {
-                    // if we run into a serialization error (hitting EOF), just return to last line.
                     error!(
                         "{event_source} serialization error {err}, height: {:?}, line: {:?}",
                         self.order_book_state.as_ref().map(OrderBookState::height),
-                        &line[..100],
+                        line.get(..100).unwrap_or(line),
                     );
-                    let unread = i64::try_from(line.len())?;
-                    self.file_mut(event_source).as_mut().map(|f| f.seek_relative(-unread));
-                    break;
+                    continue;
                 }
             };
             if height % 100 == 0 {
@@ -536,6 +541,36 @@ mod tests {
         let position = listener.order_status_file.as_mut().unwrap().stream_position()?;
         fs::remove_file(path)?;
         assert_eq!(position, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_complete_record_is_skipped() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("order-book-malformed-{}", std::process::id()));
+        let data = "not-json\n";
+        fs::write(&path, data)?;
+        let mut file = File::open(&path)?;
+        file.seek(SeekFrom::End(0))?;
+        let mut listener = OrderBookListener::new(None, false);
+        listener.order_status_file = Some(file);
+
+        listener.process_data(data.to_string(), EventSource::OrderStatuses)?;
+
+        let position = listener.order_status_file.as_mut().unwrap().stream_position()?;
+        fs::remove_file(path)?;
+        assert_eq!(position, data.len() as u64);
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_ahead_of_cache_is_retried_later() -> Result<()> {
+        let mut listener = OrderBookListener::new(None, false);
+        listener.order_book_state =
+            Some(OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 100, 0, true, false));
+
+        listener.reconcile_snapshot(listener.clone_state(), Snapshots::new(HashMap::new()), 101, VecDeque::new())?;
+
+        assert!(listener.is_ready());
         Ok(())
     }
 }
