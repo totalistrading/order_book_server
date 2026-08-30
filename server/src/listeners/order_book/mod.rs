@@ -1,5 +1,4 @@
 use crate::{
-    HL_NODE,
     listeners::{directory::DirectoryListener, order_book::state::OrderBookState},
     order_book::{
         Coin, Snapshot,
@@ -116,12 +115,6 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                 let listener = listener.clone();
                 let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
                 fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx);
-            }
-            () = sleep(Duration::from_secs(5)) => {
-                let listener = listener.lock().await;
-                if listener.is_ready() {
-                    return Err(format!("Stream has fallen behind ({HL_NODE} failed?)").into());
-                }
             }
         }
     }
