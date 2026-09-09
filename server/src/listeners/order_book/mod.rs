@@ -24,11 +24,8 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{
-        Mutex,
-        broadcast::Sender,
-        mpsc::{UnboundedSender, unbounded_channel},
-    },
+    sync::{Mutex, broadcast::Sender, mpsc::unbounded_channel},
+    task::JoinSet,
     time::{Instant, interval_at, sleep},
 };
 use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consistency};
@@ -55,9 +52,9 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
         }
     })?;
 
-    // every so often, we fetch a new snapshot and the snapshot_fetch_task starts running.
-    // Result is sent back along this channel (if error, we want to return to top level)
-    let (snapshot_fetch_task_tx, mut snapshot_fetch_task_rx) = unbounded_channel::<Result<()>>();
+    // One owner for snapshot/reconciliation and its update cache. Dropping the
+    // listener loop aborts the task instead of leaving a detached reconciler.
+    let mut snapshots = JoinSet::new();
 
     watcher.watch(&order_statuses_dir, RecursiveMode::Recursive)?;
     watcher.watch(&fills_dir, RecursiveMode::Recursive)?;
@@ -100,57 +97,48 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                     return Err("Channel closed.".into());
                 }
             },
-            snapshot_fetch_res = snapshot_fetch_task_rx.recv() => {
+            snapshot_fetch_res = snapshots.join_next(), if !snapshots.is_empty() => {
                 match snapshot_fetch_res {
-                    None => {
-                        return Err("Snapshot fetch task sender dropped".into());
-                    }
-                    Some(Err(err)) => {
-                        return Err(format!("Abci state reading error: {err}").into());
-                    }
-                    Some(Ok(())) => {}
+                    Some(Ok(Ok(()))) => ticker.reset(),
+                    Some(Ok(Err(err))) => return Err(format!("Abci state reading error: {err}").into()),
+                    Some(Err(err)) => return Err(format!("Snapshot task failed: {err}").into()),
+                    None => return Err("Snapshot task disappeared".into()),
                 }
             }
-            _ = ticker.tick() => {
-                let listener = listener.clone();
-                let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
-                fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx);
+            _ = ticker.tick(), if snapshots.is_empty() => {
+                snapshots.spawn(fetch_snapshot(dir.clone(), listener.clone()));
             }
         }
     }
 }
 
-fn fetch_snapshot(dir: PathBuf, listener: Arc<Mutex<OrderBookListener>>, tx: UnboundedSender<Result<()>>) {
-    let tx = tx.clone();
-    tokio::spawn(async move {
-        let res = match process_rmp_file(&dir).await {
-            Ok(output_fln) => {
-                let state = {
+async fn fetch_snapshot(dir: PathBuf, listener: Arc<Mutex<OrderBookListener>>) -> Result<()> {
+    match process_rmp_file(&dir).await {
+        Ok(output_fln) => {
+            let state = {
+                let mut listener = listener.lock().await;
+                listener.begin_caching();
+                listener.clone_state()
+            };
+            let snapshot = load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(output_fln.path()).await;
+            info!("Snapshot fetched");
+            // sleep to let some updates build up.
+            sleep(Duration::from_secs(1)).await;
+            match snapshot {
+                Ok((height, expected_snapshot)) => {
                     let mut listener = listener.lock().await;
-                    listener.begin_caching();
-                    listener.clone_state()
-                };
-                let snapshot = load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&output_fln).await;
-                info!("Snapshot fetched");
-                // sleep to let some updates build up.
-                sleep(Duration::from_secs(1)).await;
-                match snapshot {
-                    Ok((height, expected_snapshot)) => {
-                        let mut listener = listener.lock().await;
-                        let cache = listener.take_cache();
-                        info!("Cache has {} elements", cache.len());
-                        listener.reconcile_snapshot(state, expected_snapshot, height, cache)
-                    }
-                    Err(err) => {
-                        listener.lock().await.take_cache();
-                        Err(err)
-                    }
+                    let cache = listener.take_cache();
+                    info!("Cache has {} elements", cache.len());
+                    listener.reconcile_snapshot(state, expected_snapshot, height, cache)
+                }
+                Err(err) => {
+                    listener.lock().await.take_cache();
+                    Err(err)
                 }
             }
-            Err(err) => Err(err),
-        };
-        let _unused = tx.send(res);
-    });
+        }
+        Err(err) => Err(err),
+    }
 }
 
 pub(crate) struct OrderBookListener {
