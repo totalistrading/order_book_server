@@ -20,8 +20,40 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub(super) async fn process_rmp_file(dir: &Path) -> Result<PathBuf> {
-    let output_path = dir.join("out.json");
+pub(super) struct SnapshotFile(PathBuf);
+
+impl SnapshotFile {
+    pub(super) fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn create(dir: &Path) -> Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = dir.join(format!(
+            "book-snapshot-{}-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for SnapshotFile {
+    fn drop(&mut self) {
+        if let Err(err) = fs::remove_file(&self.0) {
+            if err.kind() != io::ErrorKind::NotFound {
+                log::warn!("Cannot remove snapshot {}: {err}", self.0.display());
+            }
+        }
+    }
+}
+
+pub(super) async fn process_rmp_file(dir: &Path) -> Result<SnapshotFile> {
+    let output = SnapshotFile::create(dir)?;
+    let output_path = output.path();
     let payload = json!({
         "type": "fileSnapshot",
         "request": {
@@ -41,7 +73,7 @@ pub(super) async fn process_rmp_file(dir: &Path) -> Result<PathBuf> {
         .send()
         .await?
         .error_for_status()?;
-    Ok(output_path)
+    Ok(output)
 }
 
 pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
@@ -154,5 +186,42 @@ impl<T> BatchQueue<T> {
 
     pub(super) fn front(&self) -> Option<&Batch<T>> {
         self.deque.front()
+    }
+}
+
+#[cfg(test)]
+mod snapshot_file_tests {
+    use super::SnapshotFile;
+
+    #[test]
+    fn snapshots_have_distinct_paths_and_cleanup_only_their_own_file() {
+        let directory = std::env::temp_dir();
+        let first = SnapshotFile::create(&directory).unwrap();
+        let second = SnapshotFile::create(&directory).unwrap();
+        assert_ne!(first.path(), second.path());
+        let first_path = first.path().to_owned();
+        let second_path = second.path().to_owned();
+        std::fs::write(&second_path, b"other snapshot").unwrap();
+        drop(first);
+        assert!(!first_path.exists());
+        assert_eq!(std::fs::read(&second_path).unwrap(), b"other snapshot");
+        drop(second);
+        assert!(!second_path.exists());
+    }
+
+    #[tokio::test]
+    async fn aborting_an_owned_snapshot_task_cleans_up_its_output() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            let file = SnapshotFile::create(&std::env::temp_dir()).unwrap();
+            tx.send(file.path().to_owned()).unwrap();
+            std::future::pending::<()>().await;
+            drop(file);
+        });
+        let path = rx.await.unwrap();
+        assert!(path.exists());
+        tasks.shutdown().await;
+        assert!(!path.exists());
     }
 }
