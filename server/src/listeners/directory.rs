@@ -147,7 +147,7 @@ mod tests {
     }
 
     async fn create_mock_data(event_source: EventSource, mock_dir: &Path) -> Result<String> {
-        // set up so that the directory is initially empty
+        // The caller prepares the empty directory before installing its watch.
         let mut res = String::new();
         sleep(Duration::from_millis(100)).await;
         let mut rng = StdRng::from_seed([42; 32]);
