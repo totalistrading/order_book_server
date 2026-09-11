@@ -83,11 +83,19 @@ async fn hl_listen_with_source(
     let mut snapshots = JoinSet::new();
     let mut ticker = interval_at(Instant::now() + Duration::from_secs(5), Duration::from_secs(10));
     let mut maintenance = interval_at(Instant::now() + Duration::from_secs(1), Duration::from_secs(1));
+    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = maintenance.tick() => {
                 let pending_file_bytes = cursors.values().map(FileCursor::backlog_bytes).sum();
-                let dirty_files = dirty.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len();
+                // Notifications are only hints. Periodically revisit retained
+                // offsets so a missed/coalesced final notification cannot strand data.
+                let dirty_files = {
+                    let mut queue = dirty.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    for path in cursors.keys() { queue.push(path.clone(), false); }
+                    queue.len()
+                };
+                if dirty_files > 0 { wake.notify_one(); }
                 let mut state = listener.lock().await;
                 state.stats.pending_file_bytes = pending_file_bytes;
                 state.stats.dirty_files = dirty_files;

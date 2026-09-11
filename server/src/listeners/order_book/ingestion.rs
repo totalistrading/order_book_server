@@ -206,4 +206,30 @@ mod tests {
         std::fs::rename(&replacement.0, &fixture.0).unwrap();
         assert!(cursor.read_turn(&fixture.0, 8).is_err());
     }
+    #[test]
+    fn oversized_interval_is_skipped_once_then_new_records_can_progress() {
+        use std::io::Write;
+        let fixture = Fixture::new(b"oversized-record\n");
+        let mut cursor = FileCursor::open(&fixture.0, false, 8).unwrap();
+        assert!(cursor.read_turn(&fixture.0, 16).is_err());
+        let mut cursor = FileCursor::open(&fixture.0, true, 8).unwrap();
+        std::fs::OpenOptions::new().append(true).open(&fixture.0).unwrap().write_all(b"ok\n").unwrap();
+        assert_eq!(cursor.read_turn(&fixture.0, 4).unwrap().0, "ok\n");
+        assert!(cursor.drained());
+    }
+
+    #[test]
+    fn rotation_keeps_the_old_partial_record_and_new_file_offset_independent() {
+        use std::io::Write;
+        let old = Fixture::new(b"old");
+        let new = Fixture::new(b"new\n");
+        let mut old_cursor = FileCursor::open(&old.0, false, 100).unwrap();
+        let mut new_cursor = FileCursor::open(&new.0, false, 100).unwrap();
+        assert_eq!(old_cursor.read_turn(&old.0, 4).unwrap().0, "");
+        assert_eq!(new_cursor.read_turn(&new.0, 4).unwrap().0, "new\n");
+        std::fs::OpenOptions::new().append(true).open(&old.0).unwrap().write_all(b"\n").unwrap();
+        assert_eq!(old_cursor.read_turn(&old.0, 4).unwrap().0, "old\n");
+        assert!(old_cursor.drained());
+        assert!(new_cursor.drained());
+    }
 }
