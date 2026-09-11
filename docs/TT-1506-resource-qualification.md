@@ -38,10 +38,9 @@ precision variant, and the number of cloned levels during truncation.
 
 ## Remaining qualification
 
-TT-1506 remains in progress. The optimization does not yet bound filesystem
-notifications, record processing, unmatched pairs, or snapshot reconciliation
-caches. Fault injection, long-snapshot recovery, sustained heap measurements,
-and before/after live CPU/ingestion latency remain required.
+TT-1506 remains in progress until controlled rollout and sustained resource
+qualification complete. The bounded ingestion and recovery implementation below
+adds the queue/fault protections beyond the initial L2 optimization.
 
 The latest 64 MiB Mainnet samples contained maximum complete records of
 7,717,816 bytes (order statuses), 1,592,279 bytes (raw diffs), and 387,125 bytes
@@ -80,7 +79,8 @@ A source gap closes existing consumers, clears unmatched work and invalidates
 older snapshot attempts. Consumers must obtain a new authoritative snapshot.
 There is still only one snapshot owner. Validation-cache overflow discards that
 validation attempt while preserving healthy live state; the existing job must
-finish before another starts. No error path restarts the node or book process.
+finish before another starts. Ingestion and reconciliation gaps fence publication and resnapshot without
+restarting the node or book process.
 A continuously oversized or unavailable source can remain fenced and requires
 resource/configuration intervention; publication is never resumed with guessed
 state. Fills are deduplicated and broadcasts no longer spawn one detached task
