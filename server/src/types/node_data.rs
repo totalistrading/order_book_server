@@ -73,9 +73,20 @@ pub(crate) struct Batch<E> {
     block_time: NaiveDateTime,
     block_number: u64,
     events: Vec<E>,
+    #[serde(skip)]
+    wire_bytes: usize,
 }
 
 impl<E> Batch<E> {
+    pub(crate) fn with_wire_bytes(mut self, bytes: usize) -> Self {
+        self.wire_bytes = bytes;
+        self
+    }
+
+    pub(crate) const fn wire_bytes(&self) -> usize {
+        self.wire_bytes
+    }
+
     #[allow(clippy::unwrap_used)]
     pub(crate) fn block_time(&self) -> u64 {
         self.block_time.and_utc().timestamp_millis().try_into().unwrap()

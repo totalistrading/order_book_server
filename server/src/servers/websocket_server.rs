@@ -52,15 +52,24 @@ pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_
 
     let websocket_opts =
         yawc::Options::default().with_compression_level(yawc::CompressionLevel::new(compression_level));
-    let app = Router::new().route(
-        "/ws",
-        get({
-            let internal_message_tx = internal_message_tx.clone();
-            async move |ws_upgrade| {
-                ws_handler(ws_upgrade, internal_message_tx.clone(), listener.clone(), ignore_spot, websocket_opts)
-            }
-        }),
-    );
+    let resources = listener.clone();
+    let app = Router::new()
+        .route(
+            "/resources",
+            get(move || {
+                let resources = resources.clone();
+                async move { axum::Json(resources.lock().await.resource_status()) }
+            }),
+        )
+        .route(
+            "/ws",
+            get({
+                let internal_message_tx = internal_message_tx.clone();
+                async move |ws_upgrade| {
+                    ws_handler(ws_upgrade, internal_message_tx.clone(), listener.clone(), ignore_spot, websocket_opts)
+                }
+            }),
+        );
 
     let listener = TcpListener::bind(address).await?;
     info!("WebSocket server running at ws://{address}");
@@ -118,6 +127,11 @@ async fn handle_socket(
                 match recv_result {
                     Ok(msg) => {
                         match msg.as_ref() {
+                            InternalMessage::Gap => {
+                                // A consumer must resubscribe to an authoritative snapshot.
+                                send_socket_message(&mut socket, ServerResponse::Error("Source gap; resnapshot required".into())).await;
+                                return;
+                            }
                             InternalMessage::Snapshot{ l2_snapshots, time, height } => {
                                 universe = new_universe(l2_snapshots, ignore_spot);
                                 for sub in manager.subscriptions() {

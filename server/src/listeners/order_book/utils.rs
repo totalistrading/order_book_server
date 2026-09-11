@@ -1,5 +1,5 @@
 use crate::{
-    listeners::order_book::{L2SnapshotParams, L2Snapshots},
+    listeners::order_book::{L2SnapshotParams, L2Snapshots, ResourceLimits},
     order_book::{
         Coin, Snapshot,
         multi_book::{OrderBooks, Snapshots},
@@ -52,7 +52,7 @@ impl Drop for SnapshotFile {
     }
 }
 
-pub(super) async fn process_rmp_file(dir: &Path) -> Result<SnapshotFile> {
+pub(super) async fn process_rmp_file(dir: &Path, info_url: &str) -> Result<SnapshotFile> {
     let output = SnapshotFile::create(dir)?;
     let output_path = output.path();
     let payload = json!({
@@ -67,13 +67,7 @@ pub(super) async fn process_rmp_file(dir: &Path) -> Result<SnapshotFile> {
     });
 
     let client = Client::new();
-    client
-        .post("http://localhost:3001/info")
-        .header("Content-Type", "application/json")
-        .json(&payload)
-        .send()
-        .await?
-        .error_for_status()?;
+    client.post(info_url).header("Content-Type", "application/json").json(&payload).send().await?.error_for_status()?;
     Ok(output)
 }
 
@@ -169,32 +163,52 @@ pub(super) enum EventBatch {
 }
 
 pub(super) struct BatchQueue<T> {
-    deque: VecDeque<Batch<T>>,
+    deque: VecDeque<(Batch<T>, std::time::Instant)>,
     last_ts: Option<u64>,
+    bytes: usize,
 }
 
 impl<T> BatchQueue<T> {
     pub(super) const fn new() -> Self {
-        Self { deque: VecDeque::new(), last_ts: None }
+        Self { deque: VecDeque::new(), last_ts: None, bytes: 0 }
     }
 
-    pub(super) fn push(&mut self, block: Batch<T>) -> bool {
-        if let Some(last_ts) = self.last_ts {
-            if last_ts >= block.block_number() {
-                return false;
-            }
+    pub(super) fn push(&mut self, block: Batch<T>, limits: ResourceLimits) -> Result<bool> {
+        if self.last_ts.is_some_and(|last| last >= block.block_number()) {
+            return Ok(false);
+        }
+        if self.bytes.saturating_add(block.wire_bytes()) > limits.queue_bytes
+            || self.deque.len() >= limits.queue_heights
+            || self.deque.front().is_some_and(|(first, at)| {
+                at.elapsed() > limits.queue_age
+                    || block.block_number().saturating_sub(first.block_number()) > limits.queue_heights as u64
+            })
+        {
+            return Err(format!("unmatched queue limit: bytes={}, heights={}", self.bytes, self.deque.len()).into());
         }
         self.last_ts = Some(block.block_number());
-        self.deque.push_back(block);
-        true
+        self.bytes += block.wire_bytes();
+        self.deque.push_back((block, std::time::Instant::now()));
+        Ok(true)
+    }
+
+    pub(super) const fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub(super) fn expired(&self, limits: ResourceLimits) -> bool {
+        self.deque.front().is_some_and(|(_, at)| at.elapsed() > limits.queue_age)
     }
 
     pub(super) fn pop_front(&mut self) -> Option<Batch<T>> {
-        self.deque.pop_front()
+        self.deque.pop_front().map(|(batch, _)| {
+            self.bytes -= batch.wire_bytes();
+            batch
+        })
     }
 
     pub(super) fn front(&self) -> Option<&Batch<T>> {
-        self.deque.front()
+        self.deque.front().map(|(batch, _)| batch)
     }
 }
 
@@ -232,5 +246,45 @@ mod snapshot_file_tests {
         assert!(path.exists());
         tasks.shutdown().await;
         assert!(!path.exists());
+    }
+}
+
+#[cfg(test)]
+mod queue_limit_tests {
+    use super::*;
+
+    fn batch(height: u64, bytes: usize) -> Batch<NodeDataOrderDiff> {
+        serde_json::from_value::<Batch<NodeDataOrderDiff>>(serde_json::json!({
+            "local_time":"2026-09-11T00:00:00", "block_time":"2026-09-11T00:00:00",
+            "block_number":height, "events":[]
+        }))
+        .unwrap()
+        .with_wire_bytes(bytes)
+    }
+
+    #[test]
+    fn unmatched_bytes_are_released_and_duplicates_do_not_consume_budget() {
+        let limits = ResourceLimits { queue_bytes: 10, ..ResourceLimits::DEFAULT };
+        let mut queue = BatchQueue::new();
+        assert!(queue.push(batch(1, 10), limits).unwrap());
+        assert!(!queue.push(batch(1, 10), limits).unwrap());
+        assert!(queue.push(batch(2, 1), limits).is_err());
+        queue.pop_front().unwrap();
+        assert_eq!(queue.bytes, 0);
+        assert!(queue.push(batch(2, 10), limits).unwrap());
+    }
+
+    #[test]
+    fn unmatched_height_and_age_limits_are_independent_of_bytes() {
+        let limits = ResourceLimits { queue_heights: 2, ..ResourceLimits::DEFAULT };
+        let mut queue = BatchQueue::new();
+        queue.push(batch(1, 0), limits).unwrap();
+        assert!(queue.push(batch(4, 0), limits).is_err());
+        queue.push(batch(2, 0), limits).unwrap();
+        assert!(queue.push(batch(3, 0), limits).is_err());
+        queue.deque.front_mut().unwrap().1 =
+            std::time::Instant::now() - limits.queue_age - std::time::Duration::from_secs(1);
+        assert!(queue.expired(limits));
+        assert!(queue.push(batch(3, 0), limits).is_err());
     }
 }

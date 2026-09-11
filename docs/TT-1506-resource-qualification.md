@@ -48,3 +48,54 @@ The latest 64 MiB Mainnet samples contained maximum complete records of
 (fills). These are observations, not protocol maxima: small arbitrary record
 ceilings would reject valid traffic. Per-turn work limits must allow partial
 records and distinguish byte backlog from source-height gaps.
+
+## Bounded ingestion and recovery
+
+Filesystem notifications now coalesce into a bounded FIFO of dirty paths.
+Each path keeps its own file descriptor, byte offset and partial record. A turn
+reads at most 1 MiB before other dirty paths and snapshot completion can run.
+Complete records are parsed only after their newline arrives, including records
+larger than a read turn. Rotation retains independent cursors; replacement or
+truncation produces an explicit gap. Removed, drained files release their cursors.
+
+Defaults are configurable through positive integer environment values:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `BOOK_MAX_DIRTY_FILES` | 32 | Dirty paths and retained file cursors |
+| `BOOK_READ_TURN_BYTES` | 1048576 | Bytes read per scheduling turn |
+| `BOOK_MAX_RECORD_BYTES` | 67108864 | Maximum encoded record, including newline |
+| `BOOK_MAX_QUEUE_BYTES` | 1073741824 | Encoded bytes retained per unmatched or validation queue |
+| `BOOK_MAX_QUEUE_HEIGHTS` | 4096 | Queued batches and unmatched height span |
+| `BOOK_MAX_QUEUE_AGE_SECONDS` | 120 | Wall-clock residence of unmatched/validation work |
+
+These bound retained encoded input, not total process heap: the full authoritative
+L4 state, decoded object overhead, published views and one reconciliation clone
+also consume memory. The 64 MiB record default is over eight times the sampled
+7.7 MB status record. It is not a claim about a protocol maximum. A record that
+exceeds the configured ceiling explicitly fences the stream and is skipped once
+in favor of a fresh snapshot, rather than rereading the same invalid interval.
+
+A source gap closes existing consumers, clears unmatched work and invalidates
+older snapshot attempts. Consumers must obtain a new authoritative snapshot.
+There is still only one snapshot owner. Validation-cache overflow discards that
+validation attempt while preserving healthy live state; the existing job must
+finish before another starts. No error path restarts the node or book process.
+A continuously oversized or unavailable source can remain fenced and requires
+resource/configuration intervention; publication is never resumed with guessed
+state. Fills are deduplicated and broadcasts no longer spawn one detached task
+per batch.
+
+The private book server exposes `GET /resources` for local qualification. It
+reports source height, read/processing/lock-wait counters, file backlog, queue
+bytes, gaps and latest snapshot clone/parse/reconciliation durations. This is a
+diagnostic snapshot, not an end-to-end health guarantee.
+
+Unit tests cover byte/height/age limits, duplicate accounting, queue release,
+100,000 coalesced notifications, fair requeue order, partial UTF-8 records,
+replacement/truncation, explicit malformed-record recovery, stale snapshot
+fencing and validation overflow without discarding live state. The Linux
+integration test holds a snapshot request beyond the normal interval, floods
+bounded ingestion, verifies there is only one request owner, and then verifies
+resnapshot recovery and resumed block progress. Live sustained qualification is
+still required before closing TT-1506.
