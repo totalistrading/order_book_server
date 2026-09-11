@@ -193,21 +193,23 @@ async fn hl_listen_with_source(
 }
 
 async fn fetch_snapshot(dir: PathBuf, listener: Arc<Mutex<OrderBookListener>>, info_url: String) -> Result<()> {
-    let epoch = listener.lock().await.recovery_epoch;
     let started = Instant::now();
-    match process_rmp_file(&dir, &info_url).await {
+    // Capture the validation baseline before asking the node for its snapshot,
+    // so updates during export are available to reach that snapshot's height.
+    let (epoch, state, timeout) = {
+        let mut listener = listener.lock().await;
+        let epoch = listener.recovery_epoch;
+        listener.begin_caching();
+        let cloning = Instant::now();
+        let state = listener.clone_state();
+        listener.stats.snapshot_clone_ms = cloning.elapsed().as_millis() as u64;
+        (epoch, state, listener.limits.snapshot_timeout)
+    };
+    match process_rmp_file(&dir, &info_url, timeout).await {
         Ok(output_fln) => {
-            let state = {
-                let mut listener = listener.lock().await;
-                if listener.recovery_epoch != epoch {
-                    return Ok(());
-                }
-                listener.begin_caching();
-                let cloning = Instant::now();
-                let state = listener.clone_state();
-                listener.stats.snapshot_clone_ms = cloning.elapsed().as_millis() as u64;
-                state
-            };
+            if listener.lock().await.recovery_epoch != epoch {
+                return Ok(());
+            }
             let parsing = Instant::now();
             let snapshot = load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(output_fln.path()).await;
             listener.lock().await.stats.snapshot_parse_ms = parsing.elapsed().as_millis() as u64;
@@ -221,12 +223,21 @@ async fn fetch_snapshot(dir: PathBuf, listener: Arc<Mutex<OrderBookListener>>, i
                     listener.finish_snapshot(epoch, state, expected_snapshot, height)
                 }
                 Err(err) => {
-                    listener.lock().await.take_cache();
-                    Err(err)
+                    let mut listener = listener.lock().await;
+                    listener.take_cache();
+                    listener.stats.snapshot_failures += 1;
+                    warn!("Snapshot validation unavailable; preserving current live state: {err}");
+                    Ok(())
                 }
             }
         }
-        Err(err) => Err(err),
+        Err(err) => {
+            let mut listener = listener.lock().await;
+            listener.take_cache();
+            listener.stats.snapshot_failures += 1;
+            warn!("Snapshot request unavailable; preserving current live state: {err}");
+            Ok(())
+        }
     }
 }
 
@@ -238,6 +249,7 @@ struct ResourceLimits {
     queue_bytes: usize,
     queue_heights: usize,
     queue_age: Duration,
+    snapshot_timeout: Duration,
 }
 
 impl ResourceLimits {
@@ -248,6 +260,7 @@ impl ResourceLimits {
         queue_bytes: 1024 * 1024 * 1024,
         queue_heights: 4096,
         queue_age: Duration::from_secs(120),
+        snapshot_timeout: Duration::from_secs(120),
     };
 
     fn from_env() -> Result<Self> {
@@ -272,6 +285,10 @@ impl ResourceLimits {
             queue_age: Duration::from_secs(
                 number("BOOK_MAX_QUEUE_AGE_SECONDS", defaults.queue_age.as_secs() as usize)? as u64,
             ),
+            snapshot_timeout: Duration::from_secs(number(
+                "BOOK_SNAPSHOT_TIMEOUT_SECONDS",
+                defaults.snapshot_timeout.as_secs() as usize,
+            )? as u64),
         })
     }
 }
@@ -283,6 +300,7 @@ struct ResourceStats {
     process_time_us: u64,
     lock_wait_us: u64,
     source_gaps: u64,
+    snapshot_failures: u64,
     pending_file_bytes: u64,
     dirty_files: usize,
     snapshot_clone_ms: u64,
@@ -297,6 +315,7 @@ impl ResourceStats {
         process_time_us: 0,
         lock_wait_us: 0,
         source_gaps: 0,
+        snapshot_failures: 0,
         pending_file_bytes: 0,
         dirty_files: 0,
         snapshot_clone_ms: 0,
@@ -766,6 +785,40 @@ mod tests {
         listener.receive_batch(EventBatch::Fills(empty_batch(101))).unwrap();
         assert!(matches!(rx.try_recv().unwrap().as_ref(), InternalMessage::Fills { .. }));
         assert!(rx.try_recv().is_err());
+    }
+    #[tokio::test]
+    async fn unavailable_validation_does_not_discard_healthy_live_state() {
+        let app = axum::Router::new()
+            .route("/info", axum::routing::post(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }))
+            .route("/hang", axum::routing::post(|| async { std::future::pending::<axum::http::StatusCode>().await }));
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", socket.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(socket, app).await.unwrap();
+        });
+        let listener = Arc::new(Mutex::new(OrderBookListener::new(None, false)));
+        {
+            let mut state = listener.lock().await;
+            state.order_book_state =
+                Some(OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 100, 1, true, false));
+            state.limits.snapshot_timeout = Duration::from_millis(25);
+        }
+        for path in ["info", "hang"] {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                fetch_snapshot(std::env::temp_dir(), listener.clone(), format!("{base}/{path}")),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        let state = listener.lock().await;
+        assert!(state.is_ready());
+        assert!(state.fetched_snapshot_cache.is_none());
+        assert_eq!(state.stats.source_gaps, 0);
+        assert_eq!(state.stats.snapshot_failures, 2);
+        server.abort();
+        let _unused = server.await;
     }
 }
 

@@ -67,6 +67,7 @@ Defaults are configurable through positive integer environment values:
 | `BOOK_MAX_QUEUE_BYTES` | 1073741824 | Encoded bytes retained per unmatched or validation queue |
 | `BOOK_MAX_QUEUE_HEIGHTS` | 4096 | Queued batches and unmatched height span |
 | `BOOK_MAX_QUEUE_AGE_SECONDS` | 120 | Wall-clock residence of unmatched/validation work |
+| `BOOK_SNAPSHOT_TIMEOUT_SECONDS` | 120 | HTTP snapshot request deadline |
 
 These bound retained encoded input, not total process heap: the full authoritative
 L4 state, decoded object overhead, published views and one reconciliation clone
@@ -74,6 +75,12 @@ also consume memory. The 64 MiB record default is over eight times the sampled
 7.7 MB status record. It is not a claim about a protocol maximum. A record that
 exceeds the configured ceiling explicitly fences the stream and is skipped once
 in favor of a fresh snapshot, rather than rereading the same invalid interval.
+
+Validation captures its baseline before requesting the node snapshot, retaining
+updates across export as well as parsing. Failed or timed-out validation requests
+preserve valid live state and retry after the existing owner completes. A failed
+initial snapshot leaves the stream unready. Request failure counts are exposed
+in `/resources`.
 
 A source gap closes existing consumers, clears unmatched work and invalidates
 older snapshot attempts. Consumers must obtain a new authoritative snapshot.

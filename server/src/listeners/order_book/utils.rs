@@ -52,7 +52,7 @@ impl Drop for SnapshotFile {
     }
 }
 
-pub(super) async fn process_rmp_file(dir: &Path, info_url: &str) -> Result<SnapshotFile> {
+pub(super) async fn process_rmp_file(dir: &Path, info_url: &str, timeout: std::time::Duration) -> Result<SnapshotFile> {
     let output = SnapshotFile::create(dir)?;
     let output_path = output.path();
     let payload = json!({
@@ -66,7 +66,7 @@ pub(super) async fn process_rmp_file(dir: &Path, info_url: &str) -> Result<Snaps
         "includeHeightInOutput": true
     });
 
-    let client = Client::new();
+    let client = Client::builder().timeout(timeout).build()?;
     client.post(info_url).header("Content-Type", "application/json").json(&payload).send().await?.error_for_status()?;
     Ok(output)
 }
