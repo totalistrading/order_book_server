@@ -166,16 +166,30 @@ impl FileCursor {
     }
 }
 
-/// Prefer a drained old file from the rotating stream; never evict unread work.
-pub(super) fn evict_drained_cursor(cursors: &mut HashMap<PathBuf, FileCursor>, root: &Path) -> bool {
+fn hourly_position(path: &Path) -> Option<(u32, u32)> {
+    let hour = path.file_name()?.to_str()?.parse::<u32>().ok()?;
+    let date_path = path.parent()?;
+    let date = date_path.file_name()?.to_str()?;
+    if hour > 23 || date.len() != 8 || date_path.parent()?.file_name()? != "hourly" {
+        return None;
+    }
+    Some((date.parse().ok()?, hour))
+}
+
+/// Only retire an older hourly file of the stream that has demonstrably rotated.
+/// A caught-up current file must remain available for the notification fallback.
+pub(super) fn evict_retired_cursor(cursors: &mut HashMap<PathBuf, FileCursor>, root: &Path, incoming: &Path) -> bool {
+    let Some(new_position) = hourly_position(incoming) else {
+        return false;
+    };
     let oldest = cursors
         .iter()
-        .filter(|(path, cursor)| cursor.drained() && !cursor.needs_attention(path))
-        .min_by_key(|(path, _)| {
-            (!path.starts_with(root), path.metadata().and_then(|metadata| metadata.modified()).ok())
+        .filter(|(path, cursor)| path.starts_with(root) && cursor.drained() && !cursor.needs_attention(path))
+        .filter_map(|(path, _)| {
+            hourly_position(path).filter(|position| *position < new_position).map(|position| (position, path.clone()))
         })
-        .map(|(path, _)| path.clone());
-    if let Some(path) = oldest {
+        .min_by_key(|(position, _)| *position);
+    if let Some((_, path)) = oldest {
         cursors.remove(&path);
         true
     } else {
@@ -320,16 +334,32 @@ mod tests {
     }
 
     #[test]
-    fn cursor_capacity_reclaims_only_quiet_drained_files() {
-        let quiet = Fixture::new(b"done\n");
-        let unread = Fixture::new(b"pending\n");
+    fn cursor_capacity_preserves_current_files_and_retires_only_rotated_paths() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!("tt1506-retirement-{}", std::process::id()));
+        let status_root = root.join("statuses");
+        let fill_root = root.join("fills");
+        std::fs::create_dir_all(status_root.join("hourly/20260911")).unwrap();
+        std::fs::create_dir_all(fill_root.join("hourly/20260911")).unwrap();
+        let old = status_root.join("hourly/20260911/19");
+        let incoming = status_root.join("hourly/20260911/20");
+        let current_fill = fill_root.join("hourly/20260911/20");
+        for path in [&old, &incoming, &current_fill] {
+            std::fs::write(path, b"done\n").unwrap();
+        }
         let mut cursors = HashMap::from([
-            (quiet.0.clone(), FileCursor::open(&quiet.0, true, 100).unwrap()),
-            (unread.0.clone(), FileCursor::open(&unread.0, false, 100).unwrap()),
+            (old.clone(), FileCursor::open(&old, true, 100).unwrap()),
+            (current_fill.clone(), FileCursor::open(&current_fill, true, 100).unwrap()),
         ]);
-        assert!(evict_drained_cursor(&mut cursors, &std::env::temp_dir()));
-        assert!(!cursors.contains_key(&quiet.0));
-        assert!(cursors.contains_key(&unread.0));
-        assert!(!evict_drained_cursor(&mut cursors, &std::env::temp_dir()));
+        assert!(evict_retired_cursor(&mut cursors, &status_root, &incoming));
+        assert!(!cursors.contains_key(&old));
+        assert!(cursors.contains_key(&current_fill));
+        cursors.insert(incoming.clone(), FileCursor::open(&incoming, true, 100).unwrap());
+        // A historical notification cannot evict a current file of either stream.
+        assert!(!evict_retired_cursor(&mut cursors, &status_root, &old));
+        std::fs::OpenOptions::new().append(true).open(&current_fill).unwrap().write_all(b"next\n").unwrap();
+        assert!(cursors[&current_fill].needs_attention(&current_fill));
+        drop(cursors);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

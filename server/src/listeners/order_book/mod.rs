@@ -42,7 +42,7 @@ async fn hl_listen_with_source(
     info_url: String,
     limits: ResourceLimits,
 ) -> Result<()> {
-    use ingestion::{DirtyFiles, FileCursor, evict_drained_cursor};
+    use ingestion::{DirtyFiles, FileCursor, evict_retired_cursor};
     use std::sync::Mutex as StdMutex;
     use tokio::sync::Notify;
 
@@ -133,7 +133,7 @@ async fn hl_listen_with_source(
                                 let tracking_source = cursors.keys().any(|known| known.starts_with(root));
                                 cursors.retain(|path, cursor| path.exists() || !cursor.drained());
                                 if cursors.len() >= limits.dirty_files {
-                                    evict_drained_cursor(&mut cursors, root);
+                                    evict_retired_cursor(&mut cursors, root, &path);
                                 }
                                 if cursors.len() >= limits.dirty_files {
                                     listener.lock().await.fence("file cursor capacity exceeded");
