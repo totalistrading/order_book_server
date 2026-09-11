@@ -329,12 +329,12 @@ impl OrderBookListener {
         self.order_book_state.as_mut().map(|o| o.compute_snapshot())
     }
 
-    pub(crate) fn compute_l2_snapshot(&self) -> Option<(u64, L2Snapshots)> {
+    pub(crate) fn compute_l2_snapshot(&self) -> Option<(u64, u64, L2Snapshots)> {
         self.order_book_state.as_ref().map(|o| o.compute_l2_snapshot())
     }
 
     // prevent snapshotting mutiple times at the same height
-    fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, L2Snapshots)> {
+    fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, u64, L2Snapshots)> {
         self.order_book_state.as_mut().and_then(|o| o.l2_snapshots(prevent_future_snaps))
     }
 }
@@ -438,11 +438,13 @@ impl DirectoryListener for OrderBookListener {
         let snapshot = self.l2_snapshots(true);
         if let Some(snapshot) = snapshot {
             if let Some(tx) = &self.internal_message_tx {
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let snapshot = Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
-                    let _unused = tx.send(snapshot);
+                // Preserve completed snapshot order; detached tasks can race.
+                let snapshot = Arc::new(InternalMessage::Snapshot {
+                    l2_snapshots: snapshot.2,
+                    time: snapshot.0,
+                    height: snapshot.1,
                 });
+                let _unused = tx.send(snapshot);
             }
         }
         Ok(())
@@ -465,7 +467,7 @@ pub(crate) struct TimedSnapshots {
 
 // Messages sent from node data listener to websocket dispatch to support streaming
 pub(crate) enum InternalMessage {
-    Snapshot { l2_snapshots: L2Snapshots, time: u64 },
+    Snapshot { l2_snapshots: L2Snapshots, time: u64, height: u64 },
     Fills { batch: Batch<NodeDataFill> },
     L4BookUpdates { diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },
 }

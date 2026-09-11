@@ -41,6 +41,7 @@ impl Level {
 pub(crate) struct L2Book {
     coin: String,
     time: u64,
+    height: u64,
     levels: [Vec<Level>; 2],
 }
 
@@ -51,8 +52,11 @@ pub(crate) enum L4Book {
 }
 
 impl L2Book {
-    pub(crate) const fn from_l2_snapshot(coin: String, snapshot: [Vec<Level>; 2], time: u64) -> Self {
-        Self { coin, time, levels: snapshot }
+    pub(crate) const fn height(&self) -> u64 {
+        self.height
+    }
+    pub(crate) const fn from_l2_snapshot(coin: String, snapshot: [Vec<Level>; 2], time: u64, height: u64) -> Self {
+        Self { coin, time, height, levels: snapshot }
     }
 }
 
@@ -190,5 +194,18 @@ mod tests {
     #[test]
     fn incomplete_fill_pair_is_ignored() {
         assert!(Trade::from_fills(HashMap::new()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod source_view_tests {
+    use super::L2Book;
+    #[test]
+    fn empty_l2_snapshot_carries_completed_source_position() {
+        let book = L2Book::from_l2_snapshot("#10".into(), [vec![], vec![]], 1234, 42);
+        let value = serde_json::to_value(book).unwrap();
+        assert_eq!(value["height"], 42);
+        assert_eq!(value["time"], 1234);
+        assert_eq!(value["levels"], serde_json::json!([[], []]));
     }
 }
