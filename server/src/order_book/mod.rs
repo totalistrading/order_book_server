@@ -26,7 +26,7 @@ impl<O: Clone> Snapshot<O> {
     }
 
     pub(crate) fn truncate(&self, n: usize) -> Self {
-        Self(self.0.clone().map(|orders| orders.into_iter().take(n).collect_vec()))
+        Self(std::array::from_fn(|side| self.0[side].iter().take(n).cloned().collect()))
     }
 }
 
@@ -397,5 +397,33 @@ mod tests {
         let [b2, a2] = s2.0.map(BTreeSet::from_iter);
         assert_eq!(b1, b2);
         assert_eq!(a1, a2);
+    }
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    use super::Snapshot;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct Counted(Arc<AtomicUsize>);
+    impl Clone for Counted {
+        fn clone(&self) -> Self {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Self(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn truncation_only_clones_requested_levels() {
+        let clones = Arc::new(AtomicUsize::new(0));
+        let snapshot = Snapshot(std::array::from_fn(|_| (0..1000).map(|_| Counted(clones.clone())).collect()));
+        let truncated = snapshot.truncate(20);
+        assert_eq!([truncated.as_ref()[0].len(), truncated.as_ref()[1].len()], [20, 20]);
+        assert_eq!(clones.load(Ordering::Relaxed), 40);
+        assert_eq!(snapshot.truncate(0).as_ref()[0].len(), 0);
+        assert_eq!(clones.load(Ordering::Relaxed), 40);
     }
 }

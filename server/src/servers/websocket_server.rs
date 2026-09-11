@@ -1,12 +1,11 @@
 use crate::{
     listeners::order_book::{
-        InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots, hl_listen,
+        InternalMessage, L2SnapshotMap, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots, hl_listen,
     },
-    order_book::{Coin, Snapshot},
+    order_book::Coin,
     prelude::*,
     types::{
         L2Book, L4Book, L4BookUpdates, L4Order, Trade,
-        inner::InnerLevel,
         node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
         subscription::{
             ClientMessage, DEFAULT_LEVELS, ServerResponse, Subscription, SubscriptionManager, is_hip4_coin,
@@ -263,7 +262,7 @@ fn new_universe(l2_snapshots: &L2Snapshots, ignore_spot: bool) -> HashSet<String
 async fn send_ws_data_from_snapshot(
     socket: &mut WebSocket,
     subscription: &Subscription,
-    snapshot: &HashMap<Coin, HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>,
+    snapshot: &L2SnapshotMap,
     time: u64,
     height: u64,
     sent_positions: &mut HashMap<String, u64>,
