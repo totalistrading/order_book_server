@@ -102,7 +102,12 @@ pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
         }
     }
     if !snapshot_map.is_empty() {
-        return Err("Extra orderbooks detected".to_string().into());
+        let samples: Vec<_> = snapshot_map
+            .iter()
+            .take(8)
+            .map(|(coin, book)| format!("{coin:?}:{} bids/{} asks", book.as_ref()[0].len(), book.as_ref()[1].len()))
+            .collect();
+        return Err(format!("Extra orderbooks detected: {samples:?}").into());
     }
     Ok(())
 }

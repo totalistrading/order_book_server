@@ -323,6 +323,7 @@ struct ResourceStats {
     source_gaps: u64,
     snapshot_failures: u64,
     snapshot_reloads: u64,
+    last_snapshot_reload_reason: Option<String>,
     pending_file_bytes: u64,
     dirty_files: usize,
     snapshot_clone_ms: u64,
@@ -339,6 +340,7 @@ impl ResourceStats {
         source_gaps: 0,
         snapshot_failures: 0,
         snapshot_reloads: 0,
+        last_snapshot_reload_reason: None,
         pending_file_bytes: 0,
         dirty_files: 0,
         snapshot_clone_ms: 0,
@@ -588,6 +590,7 @@ impl OrderBookListener {
         if let Err(err) =
             validate_snapshot_consistency(&state.compute_snapshot().snapshot, &expected_snapshot, self.ignore_spot)
         {
+            self.stats.last_snapshot_reload_reason = Some(err.to_string().chars().take(512).collect());
             warn!("Snapshot diverged ({err}); reloading authoritative node snapshot");
             let mut recovered = OrderBookState::from_snapshot(expected_snapshot, height, 0, true, self.ignore_spot);
             while let Some((order_statuses, order_diffs)) = cache.pop_front() {
