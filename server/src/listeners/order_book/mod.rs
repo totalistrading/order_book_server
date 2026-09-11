@@ -42,7 +42,7 @@ async fn hl_listen_with_source(
     info_url: String,
     limits: ResourceLimits,
 ) -> Result<()> {
-    use ingestion::{DirtyFiles, FileCursor};
+    use ingestion::{DirtyFiles, FileCursor, evict_drained_cursor};
     use std::sync::Mutex as StdMutex;
     use tokio::sync::Notify;
 
@@ -87,12 +87,15 @@ async fn hl_listen_with_source(
     loop {
         tokio::select! {
             _ = maintenance.tick() => {
+                cursors.retain(|path, cursor| path.exists() || !cursor.drained());
                 let pending_file_bytes = cursors.values().map(FileCursor::backlog_bytes).sum();
                 // Notifications are only hints. Periodically revisit retained
                 // offsets so a missed/coalesced final notification cannot strand data.
                 let dirty_files = {
                     let mut queue = dirty.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    for path in cursors.keys() { queue.push(path.clone(), false); }
+                    for (path, cursor) in &cursors {
+                        if cursor.needs_attention(path) { queue.push(path.clone(), false); }
+                    }
                     queue.len()
                 };
                 if dirty_files > 0 { wake.notify_one(); }
@@ -119,9 +122,19 @@ async fn hl_listen_with_source(
                 }
                 if let Some((path, created)) = next {
                     if let Some((root, source)) = roots.iter().find(|(root, _)| path.starts_with(root)) {
+                        if !path.is_file() {
+                            if cursors.get(&path).is_some_and(|cursor| !cursor.drained()) {
+                                listener.lock().await.fence("source file removed with unread work");
+                            }
+                            cursors.remove(&path);
+                        }
                         if path.is_file() {
                             if !cursors.contains_key(&path) {
+                                let tracking_source = cursors.keys().any(|known| known.starts_with(root));
                                 cursors.retain(|path, cursor| path.exists() || !cursor.drained());
+                                if cursors.len() >= limits.dirty_files {
+                                    evict_drained_cursor(&mut cursors, root);
+                                }
                                 if cursors.len() >= limits.dirty_files {
                                     listener.lock().await.fence("file cursor capacity exceeded");
                                     cursors.clear();
@@ -129,11 +142,11 @@ async fn hl_listen_with_source(
                                 // At initial attachment, start at the tail and obtain a
                                 // fresh authoritative snapshot. A later rotated file starts
                                 // at byte zero even if its create notification was coalesced.
-                                let from_end = !created && !cursors.keys().any(|known| known.starts_with(root));
+                                let from_end = !created && !tracking_source;
                                 if from_end {
                                     listener.lock().await.fence("attaching to a file without a known offset");
                                 }
-                                match FileCursor::open(&path, from_end, limits.record_bytes) {
+                                match FileCursor::open(&path, from_end, limits.record_bytes).map(|cursor| cursor.with_max_age(limits.queue_age)) {
                                     Ok(cursor) => { cursors.insert(path.clone(), cursor); }
                                     Err(err) => listener.lock().await.fence(&format!("opening source file: {err}")),
                                 }
@@ -168,7 +181,7 @@ async fn hl_listen_with_source(
                                         // Skip the invalid interval once. Reopening at zero
                                         // would replay the same oversized/malformed interval
                                         // forever instead of allowing a fresh snapshot.
-                                        if let Ok(cursor) = FileCursor::open(&path, true, limits.record_bytes) {
+                                        if let Ok(cursor) = FileCursor::open(&path, true, limits.record_bytes).map(|cursor| cursor.with_max_age(limits.queue_age)) {
                                             cursors.insert(path.clone(), cursor);
                                         }
                                     }
@@ -457,6 +470,9 @@ impl OrderBookListener {
         }
         if self.is_ready() {
             if let Some((order_statuses, order_diffs)) = self.pop_cache() {
+                if self.order_book_state.as_ref().is_some_and(|book| order_statuses.block_number() <= book.height()) {
+                    return Ok(());
+                }
                 self.order_book_state
                     .as_mut()
                     .map(|book| book.apply_updates(order_statuses.clone(), order_diffs.clone()))
@@ -801,6 +817,21 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap().as_ref(), InternalMessage::Fills { .. }));
         assert!(rx.try_recv().is_err());
     }
+
+    #[test]
+    fn replayed_pre_snapshot_batches_are_not_published_or_cached() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let mut listener = OrderBookListener::new(Some(tx), false);
+        listener.order_book_state =
+            Some(OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 100, 1, true, false));
+        listener.begin_caching();
+        listener.receive_batch(EventBatch::Orders(empty_batch(99))).unwrap();
+        listener.receive_batch(EventBatch::BookDiffs(empty_batch(99))).unwrap();
+        assert!(rx.try_recv().is_err());
+        assert!(listener.fetched_snapshot_cache.as_ref().unwrap().is_empty());
+        assert_eq!(listener.order_book_state.as_ref().unwrap().height(), 100);
+    }
+
     #[tokio::test]
     async fn unavailable_validation_does_not_discard_healthy_live_state() {
         let app = axum::Router::new()

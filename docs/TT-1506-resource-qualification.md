@@ -66,7 +66,7 @@ Defaults are configurable through positive integer environment values:
 | `BOOK_MAX_RECORD_BYTES` | 67108864 | Maximum encoded record, including newline |
 | `BOOK_MAX_QUEUE_BYTES` | 1073741824 | Encoded bytes retained per unmatched or validation queue |
 | `BOOK_MAX_QUEUE_HEIGHTS` | 4096 | Queued batches and unmatched height span |
-| `BOOK_MAX_QUEUE_AGE_SECONDS` | 120 | Wall-clock residence of unmatched/validation work |
+| `BOOK_MAX_QUEUE_AGE_SECONDS` | 120 | Wall-clock residence of unmatched/validation work and partial records |
 | `BOOK_SNAPSHOT_TIMEOUT_SECONDS` | 120 | HTTP snapshot request deadline |
 
 These bound retained encoded input, not total process heap: the full authoritative

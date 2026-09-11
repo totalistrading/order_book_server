@@ -1,9 +1,10 @@
 //! Bounded filesystem work. A notification is a dirty-path hint, not a record.
 use std::{
     collections::{HashMap, VecDeque},
-    fs::File,
+    fs::{File, Metadata},
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 /// Coalesces repeated notifications without retaining an unbounded event queue.
@@ -63,13 +64,23 @@ pub(super) struct FileCursor {
     partial: Vec<u8>,
     max_record_bytes: usize,
     partial_record_bytes: usize,
+    partial_since: Option<Instant>,
+    max_partial_age: Duration,
 }
 
 impl FileCursor {
     pub(super) fn open(path: &Path, from_end: bool, max_record_bytes: usize) -> io::Result<Self> {
         let mut file = File::open(path)?;
         let offset = if from_end { file.seek(SeekFrom::End(0))? } else { 0 };
-        Ok(Self { file, offset, partial: Vec::new(), max_record_bytes, partial_record_bytes: 0 })
+        Ok(Self {
+            file,
+            offset,
+            partial: Vec::new(),
+            max_record_bytes,
+            partial_record_bytes: 0,
+            partial_since: None,
+            max_partial_age: Duration::from_secs(120),
+        })
     }
 
     pub(super) fn backlog_bytes(&self) -> u64 {
@@ -81,7 +92,16 @@ impl FileCursor {
         self.partial.is_empty() && self.file.metadata().is_ok_and(|metadata| metadata.len() == self.offset)
     }
 
-    pub(super) fn read_turn(&mut self, path: &Path, budget: usize) -> io::Result<(String, bool, usize)> {
+    pub(super) fn with_max_age(mut self, age: Duration) -> Self {
+        self.max_partial_age = age;
+        self
+    }
+
+    fn partial_expired(&self) -> bool {
+        self.partial_since.is_some_and(|at| at.elapsed() > self.max_partial_age)
+    }
+
+    fn verify_file(&self, path: &Path) -> io::Result<Metadata> {
         let metadata = self.file.metadata()?;
         #[cfg(unix)]
         {
@@ -93,6 +113,21 @@ impl FileCursor {
         }
         if metadata.len() < self.offset {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "source file truncated; resnapshot required"));
+        }
+        Ok(metadata)
+    }
+
+    pub(super) fn needs_attention(&self, path: &Path) -> bool {
+        self.partial_expired() || self.verify_file(path).map_or(true, |metadata| metadata.len() > self.offset)
+    }
+
+    pub(super) fn read_turn(&mut self, path: &Path, budget: usize) -> io::Result<(String, bool, usize)> {
+        let _metadata = self.verify_file(path)?;
+        if self.partial_expired() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "partial source record exceeded age limit; resnapshot required",
+            ));
         }
         let mut bytes = vec![0; budget];
         let read = self.file.read(&mut bytes)?;
@@ -122,7 +157,29 @@ impl FileCursor {
         } else {
             String::new()
         };
+        if self.partial.is_empty() {
+            self.partial_since = None;
+        } else if complete_end.is_some() || self.partial_since.is_none() {
+            self.partial_since = Some(Instant::now());
+        }
         Ok((data, read > 0, read))
+    }
+}
+
+/// Prefer a drained old file from the rotating stream; never evict unread work.
+pub(super) fn evict_drained_cursor(cursors: &mut HashMap<PathBuf, FileCursor>, root: &Path) -> bool {
+    let oldest = cursors
+        .iter()
+        .filter(|(path, cursor)| cursor.drained() && !cursor.needs_attention(path))
+        .min_by_key(|(path, _)| {
+            (!path.starts_with(root), path.metadata().and_then(|metadata| metadata.modified()).ok())
+        })
+        .map(|(path, _)| path.clone());
+    if let Some(path) = oldest {
+        cursors.remove(&path);
+        true
+    } else {
+        false
     }
 }
 
@@ -201,9 +258,10 @@ mod tests {
     #[test]
     fn replacement_at_same_path_requires_resnapshot() {
         let fixture = Fixture::new(b"old\n");
-        let mut cursor = FileCursor::open(&fixture.0, false, 100).unwrap();
+        let mut cursor = FileCursor::open(&fixture.0, true, 100).unwrap();
         let replacement = Fixture::new(b"new\n");
         std::fs::rename(&replacement.0, &fixture.0).unwrap();
+        assert!(cursor.needs_attention(&fixture.0));
         assert!(cursor.read_turn(&fixture.0, 8).is_err());
     }
     #[test]
@@ -231,5 +289,47 @@ mod tests {
         assert_eq!(old_cursor.read_turn(&old.0, 4).unwrap().0, "old\n");
         assert!(old_cursor.drained());
         assert!(new_cursor.drained());
+    }
+    #[test]
+    fn quiet_cursors_do_not_fill_dirty_queue_and_append_is_detected() {
+        use std::io::Write;
+        let fixture = Fixture::new(b"done\n");
+        let cursor = FileCursor::open(&fixture.0, true, 100).unwrap();
+        let mut queue = DirtyFiles::new(1);
+        for _ in 0..100 {
+            if cursor.needs_attention(&fixture.0) {
+                queue.push(fixture.0.clone(), false);
+            }
+        }
+        queue.push("new-file".into(), true);
+        assert!(!queue.take_overflow());
+        assert_eq!(queue.len(), 1);
+        std::fs::OpenOptions::new().append(true).open(&fixture.0).unwrap().write_all(b"next\n").unwrap();
+        assert!(cursor.needs_attention(&fixture.0));
+    }
+
+    #[test]
+    fn partial_records_wait_for_bytes_but_expire_without_new_notifications() {
+        let fixture = Fixture::new(b"partial");
+        let mut cursor = FileCursor::open(&fixture.0, false, 100).unwrap();
+        cursor.read_turn(&fixture.0, 16).unwrap();
+        assert!(!cursor.needs_attention(&fixture.0));
+        cursor.partial_since = Some(Instant::now() - Duration::from_secs(121));
+        assert!(cursor.needs_attention(&fixture.0));
+        assert!(cursor.read_turn(&fixture.0, 16).is_err());
+    }
+
+    #[test]
+    fn cursor_capacity_reclaims_only_quiet_drained_files() {
+        let quiet = Fixture::new(b"done\n");
+        let unread = Fixture::new(b"pending\n");
+        let mut cursors = HashMap::from([
+            (quiet.0.clone(), FileCursor::open(&quiet.0, true, 100).unwrap()),
+            (unread.0.clone(), FileCursor::open(&unread.0, false, 100).unwrap()),
+        ]);
+        assert!(evict_drained_cursor(&mut cursors, &std::env::temp_dir()));
+        assert!(!cursors.contains_key(&quiet.0));
+        assert!(cursors.contains_key(&unread.0));
+        assert!(!evict_drained_cursor(&mut cursors, &std::env::temp_dir()));
     }
 }
