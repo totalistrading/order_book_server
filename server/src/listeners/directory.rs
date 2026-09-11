@@ -152,7 +152,6 @@ mod tests {
         sleep(Duration::from_millis(100)).await;
         let mut rng = StdRng::from_seed([42; 32]);
         let mock_dir = event_source.event_source_dir(mock_dir).canonicalize()?;
-        clear_dir_contents(&mock_dir)?;
         let mock_dir = mock_dir.join("hourly/20250624");
         create_dir_all(&mock_dir)?;
 
@@ -215,7 +214,12 @@ mod tests {
     async fn test_trade_listener() -> Result<()> {
         let mock_path = PathBuf::from(MOCK_HL_DIR);
         let event_source = EventSource::Fills;
-        create_dir_all(event_source.event_source_dir(&mock_path))?;
+        let stream_dir = event_source.event_source_dir(&mock_path);
+        create_dir_all(&stream_dir)?;
+        clear_dir_contents(&stream_dir)?;
+        // Install the recursive watch on existing directories before generating
+        // file events; otherwise directory creation races watch registration.
+        create_dir_all(stream_dir.join("hourly/20250624"))?;
         let history = Arc::new(Mutex::new(String::new()));
         let mut test_listener = TestListener::new(history.clone());
         {
