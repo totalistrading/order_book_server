@@ -309,6 +309,7 @@ struct ResourceStats {
     lock_wait_us: u64,
     source_gaps: u64,
     snapshot_failures: u64,
+    snapshot_reloads: u64,
     pending_file_bytes: u64,
     dirty_files: usize,
     snapshot_clone_ms: u64,
@@ -324,6 +325,7 @@ impl ResourceStats {
         lock_wait_us: 0,
         source_gaps: 0,
         snapshot_failures: 0,
+        snapshot_reloads: 0,
         pending_file_bytes: 0,
         dirty_files: 0,
         snapshot_clone_ms: 0,
@@ -459,10 +461,14 @@ impl OrderBookListener {
                     .as_mut()
                     .map(|book| book.apply_updates(order_statuses.clone(), order_diffs.clone()))
                     .transpose()?;
-                let pair_bytes = order_statuses.wire_bytes().saturating_add(order_diffs.wire_bytes());
+                let pair_bytes = order_statuses
+                    .wire_bytes()
+                    .checked_add(order_diffs.wire_bytes())
+                    .ok_or("paired batch byte counter overflow")?;
+                let next_cache_bytes = self.snapshot_cache_bytes.checked_add(pair_bytes);
                 if self.fetched_snapshot_cache.as_ref().is_some_and(|cache| {
                     cache.len() >= self.limits.queue_heights
-                        || self.snapshot_cache_bytes.saturating_add(pair_bytes) > self.limits.queue_bytes
+                        || next_cache_bytes.is_none_or(|bytes| bytes > self.limits.queue_bytes)
                 }) {
                     // The live state remains valid. Discard only this validation
                     // attempt; its sole owner must finish before another starts.
@@ -473,7 +479,7 @@ impl OrderBookListener {
                     warn!("Snapshot validation cache limit reached; skipping this validation attempt");
                 }
                 if let Some(cache) = &mut self.fetched_snapshot_cache {
-                    self.snapshot_cache_bytes += pair_bytes;
+                    self.snapshot_cache_bytes = next_cache_bytes.ok_or("validation byte counter overflow")?;
                     cache.push_back((order_statuses.clone(), order_diffs.clone()));
                 }
                 if let Some(tx) = &self.internal_message_tx {
@@ -572,6 +578,7 @@ impl OrderBookListener {
                 recovered.apply_updates(order_statuses, order_diffs)?;
             }
             self.order_book_state = Some(recovered);
+            self.stats.snapshot_reloads += 1;
             if let Some(tx) = &self.internal_message_tx {
                 let _unused = tx.send(Arc::new(InternalMessage::Gap));
             }

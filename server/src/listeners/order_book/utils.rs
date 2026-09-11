@@ -177,7 +177,8 @@ impl<T> BatchQueue<T> {
         if self.last_ts.is_some_and(|last| last >= block.block_number()) {
             return Ok(false);
         }
-        if self.bytes.saturating_add(block.wire_bytes()) > limits.queue_bytes
+        let next_bytes = self.bytes.checked_add(block.wire_bytes()).ok_or("unmatched queue byte counter overflow")?;
+        if next_bytes > limits.queue_bytes
             || self.deque.len() >= limits.queue_heights
             || self.deque.front().is_some_and(|(first, at)| {
                 at.elapsed() > limits.queue_age
@@ -187,7 +188,7 @@ impl<T> BatchQueue<T> {
             return Err(format!("unmatched queue limit: bytes={}, heights={}", self.bytes, self.deque.len()).into());
         }
         self.last_ts = Some(block.block_number());
-        self.bytes += block.wire_bytes();
+        self.bytes = next_bytes;
         self.deque.push_back((block, std::time::Instant::now()));
         Ok(true)
     }
@@ -286,5 +287,17 @@ mod queue_limit_tests {
             std::time::Instant::now() - limits.queue_age - std::time::Duration::from_secs(1);
         assert!(queue.expired(limits));
         assert!(queue.push(batch(3, 0), limits).is_err());
+    }
+    #[test]
+    fn unrepresentable_queue_bytes_fail_without_advancing_accounting() {
+        let limits = ResourceLimits { queue_bytes: usize::MAX, ..ResourceLimits::DEFAULT };
+        let mut queue = BatchQueue::new();
+        queue.push(batch(1, usize::MAX), limits).unwrap();
+        assert!(queue.push(batch(2, 1), limits).is_err());
+        assert_eq!(queue.bytes, usize::MAX);
+        assert_eq!(queue.last_ts, Some(1));
+        queue.pop_front().unwrap();
+        assert!(queue.push(batch(2, 1), limits).unwrap());
+        assert_eq!(queue.bytes, 1);
     }
 }
