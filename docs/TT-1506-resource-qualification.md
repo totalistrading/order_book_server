@@ -38,13 +38,71 @@ precision variant, and the number of cloned levels during truncation.
 
 ## Remaining qualification
 
-TT-1506 remains in progress. The optimization does not yet bound filesystem
-notifications, record processing, unmatched pairs, or snapshot reconciliation
-caches. Fault injection, long-snapshot recovery, sustained heap measurements,
-and before/after live CPU/ingestion latency remain required.
+TT-1506 remains in progress until controlled rollout and sustained resource
+qualification complete. The bounded ingestion and recovery implementation below
+adds the queue/fault protections beyond the initial L2 optimization.
 
 The latest 64 MiB Mainnet samples contained maximum complete records of
 7,717,816 bytes (order statuses), 1,592,279 bytes (raw diffs), and 387,125 bytes
 (fills). These are observations, not protocol maxima: small arbitrary record
 ceilings would reject valid traffic. Per-turn work limits must allow partial
 records and distinguish byte backlog from source-height gaps.
+
+## Bounded ingestion and recovery
+
+Filesystem notifications now coalesce into a bounded FIFO of dirty paths.
+Each path keeps its own file descriptor, byte offset and partial record. A turn
+reads at most 1 MiB before other dirty paths and snapshot completion can run.
+Complete records are parsed only after their newline arrives, including records
+larger than a read turn. Rotation retains independent cursors; replacement or
+truncation produces an explicit gap. Removed, drained files release their cursors.
+
+Defaults are configurable through positive integer environment values:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `BOOK_MAX_DIRTY_FILES` | 32 | Dirty paths and retained file cursors |
+| `BOOK_READ_TURN_BYTES` | 1048576 | Bytes read per scheduling turn |
+| `BOOK_MAX_RECORD_BYTES` | 67108864 | Maximum encoded record, including newline |
+| `BOOK_MAX_QUEUE_BYTES` | 1073741824 | Encoded bytes retained per unmatched or validation queue |
+| `BOOK_MAX_QUEUE_HEIGHTS` | 4096 | Queued batches and unmatched height span |
+| `BOOK_MAX_QUEUE_AGE_SECONDS` | 120 | Wall-clock residence of unmatched/validation work and partial records |
+| `BOOK_SNAPSHOT_TIMEOUT_SECONDS` | 120 | HTTP snapshot request deadline |
+
+These bound retained encoded input, not total process heap: the full authoritative
+L4 state, decoded object overhead, published views and one reconciliation clone
+also consume memory. The 64 MiB record default is over eight times the sampled
+7.7 MB status record. It is not a claim about a protocol maximum. A record that
+exceeds the configured ceiling explicitly fences the stream and is skipped once
+in favor of a fresh snapshot, rather than rereading the same invalid interval.
+
+Validation captures its baseline before requesting the node snapshot, retaining
+updates across export as well as parsing. Failed or timed-out validation requests
+preserve valid live state and retry after the existing owner completes. A failed
+initial snapshot leaves the stream unready. Request failure counts are exposed
+in `/resources`.
+
+A source gap closes existing consumers, clears unmatched work and invalidates
+older snapshot attempts. Consumers must obtain a new authoritative snapshot.
+There is still only one snapshot owner. Validation-cache overflow discards that
+validation attempt while preserving healthy live state; the existing job must
+finish before another starts. Ingestion and reconciliation gaps fence publication and resnapshot without
+restarting the node or book process.
+A continuously oversized or unavailable source can remain fenced and requires
+resource/configuration intervention; publication is never resumed with guessed
+state. Fills are deduplicated and broadcasts no longer spawn one detached task
+per batch.
+
+The private book server exposes `GET /resources` for local qualification. It
+reports source height, read/processing/lock-wait counters, file backlog, queue
+bytes, gaps and latest snapshot clone/parse/reconciliation durations. This is a
+diagnostic snapshot, not an end-to-end health guarantee.
+
+Unit tests cover byte/height/age limits, duplicate accounting, queue release,
+100,000 coalesced notifications, fair requeue order, partial UTF-8 records,
+replacement/truncation, explicit malformed-record recovery, stale snapshot
+fencing and validation overflow without discarding live state. The Linux
+integration test holds a snapshot request beyond the normal interval, floods
+bounded ingestion, verifies there is only one request owner, and then verifies
+resnapshot recovery and resumed block progress. Live sustained qualification is
+still required before closing TT-1506.
