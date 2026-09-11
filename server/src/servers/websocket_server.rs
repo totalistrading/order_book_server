@@ -106,6 +106,7 @@ async fn handle_socket(
     let mut internal_message_rx = internal_message_tx.subscribe();
     let is_ready = listener.lock().await.is_ready();
     let mut manager = SubscriptionManager::default();
+    let mut sent_positions = HashMap::<String, u64>::new();
     let mut universe = listener.lock().await.universe().into_iter().map(|c| c.value()).collect();
     if !is_ready {
         let msg = ServerResponse::Error("Order book not ready for streaming (waiting for snapshot)".to_string());
@@ -118,10 +119,10 @@ async fn handle_socket(
                 match recv_result {
                     Ok(msg) => {
                         match msg.as_ref() {
-                            InternalMessage::Snapshot{ l2_snapshots, time } => {
+                            InternalMessage::Snapshot{ l2_snapshots, time, height } => {
                                 universe = new_universe(l2_snapshots, ignore_spot);
                                 for sub in manager.subscriptions() {
-                                    send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time).await;
+                                    send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time, *height, &mut sent_positions).await;
                                 }
                             },
                             InternalMessage::Fills{ batch } => {
@@ -162,7 +163,7 @@ async fn handle_socket(
                             info!("Client message: {text}");
 
                             if let Ok(value) = serde_json::from_str::<ClientMessage>(text) {
-                                receive_client_message(&mut socket, &mut manager, value, &universe, listener.clone()).await;
+                                receive_client_message(&mut socket, &mut manager, value, &universe, listener.clone(), &mut sent_positions).await;
                             }
                             else {
                                 let msg = ServerResponse::Error(format!("Error parsing JSON into valid websocket request: {text}"));
@@ -190,6 +191,7 @@ async fn receive_client_message(
     client_message: ClientMessage,
     universe: &HashSet<String>,
     listener: Arc<Mutex<OrderBookListener>>,
+    sent_positions: &mut HashMap<String, u64>,
 ) {
     let subscription = match &client_message {
         ClientMessage::Unsubscribe { subscription } | ClientMessage::Subscribe { subscription } => subscription.clone(),
@@ -218,11 +220,15 @@ async fn receive_client_message(
                 }
             }
         } else {
+            sent_positions.remove(&sub);
             None
         };
         let msg = ServerResponse::SubscriptionResponse(client_message);
         send_socket_message(socket, msg).await;
         if let Some(snapshot_msg) = snapshot_msg {
+            if let ServerResponse::L2Book(book) = &snapshot_msg {
+                sent_positions.insert(sub, book.height());
+            }
             send_socket_message(socket, snapshot_msg).await;
         }
     } else {
@@ -259,7 +265,16 @@ async fn send_ws_data_from_snapshot(
     subscription: &Subscription,
     snapshot: &HashMap<Coin, HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>,
     time: u64,
+    height: u64,
+    sent_positions: &mut HashMap<String, u64>,
 ) {
+    // Immediate subscription snapshots can overtake already queued broadcasts.
+    // Suppress only duplicates/older positions for that exact subscription.
+    let key = serde_json::to_string(subscription).unwrap_or_default();
+    if sent_positions.get(&key).is_some_and(|previous| height <= *previous) {
+        return;
+    }
+    sent_positions.insert(key, height);
     if let Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } = subscription {
         let snapshot = snapshot.get(&Coin::new(coin));
         if let Some(snapshot) =
@@ -268,9 +283,17 @@ async fn send_ws_data_from_snapshot(
             let n_levels = n_levels.unwrap_or(DEFAULT_LEVELS);
             let snapshot = snapshot.truncate(n_levels);
             let snapshot = snapshot.export_inner_snapshot();
-            let l2_book = L2Book::from_l2_snapshot(coin.clone(), snapshot, time);
+            let l2_book = L2Book::from_l2_snapshot(coin.clone(), snapshot, time, height);
             let msg = ServerResponse::L2Book(l2_book);
             send_socket_message(socket, msg).await;
+        } else if is_hip4_coin(coin) {
+            // A missing HIP-4 native book is empty at this completed snapshot,
+            // including on quiet blocks; never leave its previous levels alive.
+            send_socket_message(
+                socket,
+                ServerResponse::L2Book(L2Book::from_l2_snapshot(coin.clone(), [Vec::new(), Vec::new()], time, height)),
+            )
+            .await;
         } else {
             error!("Coin {coin} not found");
         }
@@ -354,20 +377,26 @@ impl Subscription {
         listener: Arc<Mutex<OrderBookListener>>,
     ) -> Result<Option<ServerResponse>> {
         if let Self::L2Book { coin, n_sig_figs, n_levels, mantissa } = self {
-            if let Some((time, snapshots)) = listener.lock().await.compute_l2_snapshot() {
+            if let Some((time, height, snapshots)) = listener.lock().await.compute_l2_snapshot() {
                 if let Some(snapshot) = snapshots
                     .as_ref()
                     .get(&Coin::new(coin))
                     .and_then(|value| value.get(&L2SnapshotParams::new(*n_sig_figs, *mantissa)))
                 {
                     let levels = snapshot.truncate(n_levels.unwrap_or(DEFAULT_LEVELS)).export_inner_snapshot();
-                    return Ok(Some(ServerResponse::L2Book(L2Book::from_l2_snapshot(coin.clone(), levels, time))));
+                    return Ok(Some(ServerResponse::L2Book(L2Book::from_l2_snapshot(
+                        coin.clone(),
+                        levels,
+                        time,
+                        height,
+                    ))));
                 }
                 if is_hip4_coin(coin) {
                     return Ok(Some(ServerResponse::L2Book(L2Book::from_l2_snapshot(
                         coin.clone(),
                         [Vec::new(), Vec::new()],
                         time,
+                        height,
                     ))));
                 }
             }
