@@ -329,8 +329,8 @@ impl OrderBookListener {
         self.order_book_state.as_mut().map(|o| o.compute_snapshot())
     }
 
-    pub(crate) fn compute_l2_snapshot(&self) -> Option<(u64, u64, L2Snapshots)> {
-        self.order_book_state.as_ref().map(|o| o.compute_l2_snapshot())
+    pub(crate) fn compute_l2_snapshot(&mut self) -> Option<(u64, u64, L2Snapshots)> {
+        self.order_book_state.as_mut().map(|o| o.compute_l2_snapshot())
     }
 
     // prevent snapshotting mutiple times at the same height
@@ -451,10 +451,14 @@ impl DirectoryListener for OrderBookListener {
     }
 }
 
-pub(crate) struct L2Snapshots(HashMap<Coin, HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>);
+pub(crate) type CoinL2Snapshots = HashMap<L2SnapshotParams, Snapshot<InnerLevel>>;
+pub(crate) type L2SnapshotMap = HashMap<Coin, Arc<CoinL2Snapshots>>;
+
+#[derive(Clone, Default)]
+pub(crate) struct L2Snapshots(Arc<L2SnapshotMap>);
 
 impl L2Snapshots {
-    pub(crate) const fn as_ref(&self) -> &HashMap<Coin, HashMap<L2SnapshotParams, Snapshot<InnerLevel>>> {
+    pub(crate) fn as_ref(&self) -> &L2SnapshotMap {
         &self.0
     }
 }

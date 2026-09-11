@@ -1,7 +1,7 @@
 use crate::{
     listeners::order_book::{L2SnapshotParams, L2Snapshots},
     order_book::{
-        Snapshot,
+        Coin, Snapshot,
         multi_book::{OrderBooks, Snapshots},
         types::InnerOrder,
     },
@@ -14,7 +14,8 @@ use crate::{
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use reqwest::Client;
 use serde_json::json;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -118,39 +119,47 @@ impl L2SnapshotParams {
     }
 }
 
-pub(super) fn compute_l2_snapshots<O: InnerOrder + Send + Sync>(order_books: &OrderBooks<O>) -> L2Snapshots {
-    L2Snapshots(
-        order_books
-            .as_ref()
-            .par_iter()
-            .map(|(coin, order_book)| {
-                let mut entries = Vec::new();
-                let snapshot = order_book.to_l2_snapshot(None, None, None);
-                entries.push((L2SnapshotParams { n_sig_figs: None, mantissa: None }, snapshot));
-                let mut add_new_snapshot = |n_sig_figs: Option<u32>, mantissa: Option<u64>, idx: usize| {
-                    if let Some((_, last_snapshot)) = &entries.get(entries.len() - idx) {
-                        let snapshot = last_snapshot.to_l2_snapshot(None, n_sig_figs, mantissa);
-                        entries.push((L2SnapshotParams { n_sig_figs, mantissa }, snapshot));
-                    }
-                };
-                for n_sig_figs in (2..=5).rev() {
-                    if n_sig_figs == 5 {
-                        for mantissa in [None, Some(2), Some(5)] {
-                            if mantissa == Some(5) {
-                                // Some(2) is NOT a superset of this info!
-                                add_new_snapshot(Some(n_sig_figs), mantissa, 2);
-                            } else {
-                                add_new_snapshot(Some(n_sig_figs), mantissa, 1);
-                            }
-                        }
-                    } else {
-                        add_new_snapshot(Some(n_sig_figs), None, 1);
-                    }
+pub(super) fn refresh_l2_snapshots<O: InnerOrder + Send + Sync>(
+    order_books: &OrderBooks<O>,
+    cached: &mut L2Snapshots,
+    dirty: &HashSet<Coin>,
+) {
+    if dirty.is_empty() {
+        return;
+    }
+    let refreshed: Vec<_> = order_books
+        .as_ref()
+        .par_iter()
+        .filter(|(coin, _)| dirty.contains(*coin))
+        .map(|(coin, order_book)| {
+            let mut entries = Vec::new();
+            let snapshot = order_book.to_l2_snapshot(None, None, None);
+            entries.push((L2SnapshotParams { n_sig_figs: None, mantissa: None }, snapshot));
+            let mut add_new_snapshot = |n_sig_figs: Option<u32>, mantissa: Option<u64>, idx: usize| {
+                if let Some((_, last_snapshot)) = &entries.get(entries.len() - idx) {
+                    let snapshot = last_snapshot.to_l2_snapshot(None, n_sig_figs, mantissa);
+                    entries.push((L2SnapshotParams { n_sig_figs, mantissa }, snapshot));
                 }
-                (coin.clone(), entries.into_iter().collect::<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>())
-            })
-            .collect(),
-    )
+            };
+            for n_sig_figs in (2..=5).rev() {
+                if n_sig_figs == 5 {
+                    for mantissa in [None, Some(2), Some(5)] {
+                        if mantissa == Some(5) {
+                            // Some(2) is NOT a superset of this info!
+                            add_new_snapshot(Some(n_sig_figs), mantissa, 2);
+                        } else {
+                            add_new_snapshot(Some(n_sig_figs), mantissa, 1);
+                        }
+                    }
+                } else {
+                    add_new_snapshot(Some(n_sig_figs), None, 1);
+                }
+            }
+            (coin.clone(), Arc::new(entries.into_iter().collect::<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>()))
+        })
+        .collect();
+    // Published views remain immutable; only the map of coin references is copied.
+    Arc::make_mut(&mut cached.0).extend(refreshed);
 }
 
 pub(super) enum EventBatch {
