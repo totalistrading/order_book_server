@@ -609,6 +609,11 @@ impl OrderBookListener {
         self.order_book_state = Some(recovered);
         if empty_additions {
             self.stats.empty_book_refreshes += 1;
+            if let Some((time, height, l2_snapshots)) = self.l2_snapshots(true) {
+                if let Some(tx) = &self.internal_message_tx {
+                    let _unused = tx.send(Arc::new(InternalMessage::Snapshot { l2_snapshots, time, height }));
+                }
+            }
         } else {
             self.stats.snapshot_reloads += 1;
             if let Some(tx) = &self.internal_message_tx {
@@ -742,6 +747,12 @@ mod tests {
         assert_eq!(listener.compute_snapshot().unwrap().time, 1234);
         assert_eq!(listener.stats.empty_book_refreshes, 1);
         assert_eq!(listener.stats.snapshot_reloads, 0);
+        let update = rx.try_recv().unwrap();
+        let InternalMessage::Snapshot { l2_snapshots, time, height } = update.as_ref() else {
+            panic!("empty additions must publish a snapshot, not a gap");
+        };
+        assert!(l2_snapshots.as_ref().contains_key(&Coin::new("NEW")));
+        assert_eq!((*height, *time), (100, 1234));
         assert!(rx.try_recv().is_err());
         Ok(())
     }
@@ -766,6 +777,12 @@ mod tests {
         assert_eq!((result.height, result.time), (101, expected_time));
         assert!(listener.universe().contains(&Coin::new("NEW")));
         assert_eq!(listener.stats.empty_book_refreshes, 1);
+        let update = rx.try_recv().unwrap();
+        let InternalMessage::Snapshot { l2_snapshots, time, height } = update.as_ref() else {
+            panic!("empty additions must publish a snapshot, not a gap");
+        };
+        assert!(l2_snapshots.as_ref().contains_key(&Coin::new("NEW")));
+        assert_eq!((*height, *time), (101, expected_time));
         assert!(rx.try_recv().is_err());
         Ok(())
     }
