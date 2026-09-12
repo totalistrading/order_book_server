@@ -71,11 +71,17 @@ pub(super) async fn process_rmp_file(dir: &Path, info_url: &str, timeout: std::t
     Ok(output)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum SnapshotConsistency {
+    Equal,
+    EmptyBooksAdded,
+}
+
 pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
     snapshot: &Snapshots<O>,
     expected: &Snapshots<O>,
     ignore_spot: bool,
-) -> Result<()> {
+) -> Result<SnapshotConsistency> {
     let mut snapshot_map: HashMap<_, _> =
         expected.as_ref().iter().filter(|(c, _)| !c.is_spot() || !ignore_spot).collect();
 
@@ -101,7 +107,7 @@ pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
             return Err(format!("Missing {} book", coin.value()).into());
         }
     }
-    if !snapshot_map.is_empty() {
+    if snapshot_map.values().any(|book| book.as_ref().iter().any(|orders| !orders.is_empty())) {
         let samples: Vec<_> = snapshot_map
             .iter()
             .take(8)
@@ -109,7 +115,7 @@ pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
             .collect();
         return Err(format!("Extra orderbooks detected: {samples:?}").into());
     }
-    Ok(())
+    Ok(if snapshot_map.is_empty() { SnapshotConsistency::Equal } else { SnapshotConsistency::EmptyBooksAdded })
 }
 
 impl L2SnapshotParams {
@@ -304,5 +310,43 @@ mod queue_limit_tests {
         queue.pop_front().unwrap();
         assert!(queue.push(batch(2, 1), limits).unwrap());
         assert_eq!(queue.bytes, 1);
+    }
+}
+
+#[cfg(test)]
+mod consistency_tests {
+    use super::*;
+    use crate::order_book::multi_book::load_snapshots_from_str;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Order(u64);
+    impl TryFrom<u64> for Order {
+        type Error = crate::prelude::Error;
+        fn try_from(value: u64) -> Result<Self> {
+            Ok(Self(value))
+        }
+    }
+    fn snapshot(json: &str) -> Snapshots<Order> {
+        load_snapshots_from_str::<Order, u64>(json).unwrap().1
+    }
+
+    #[test]
+    fn empty_addition_requires_exact_existing_order_equality() {
+        let baseline = snapshot(r#"[100, [["BTC", [[1], [2]]]]]"#);
+        let same = snapshot(r#"[100, [["BTC", [[1], [2]]]]]"#);
+        assert_eq!(validate_snapshot_consistency(&baseline, &same, false).unwrap(), SnapshotConsistency::Equal);
+        let added = snapshot(r#"[100, [["BTC", [[1], [2]]], ["NEW", [[], []]]]]"#);
+        assert_eq!(
+            validate_snapshot_consistency(&baseline, &added, false).unwrap(),
+            SnapshotConsistency::EmptyBooksAdded
+        );
+        for json in [
+            r#"[100, [["BTC", [[3], [2]]], ["NEW", [[], []]]]]"#,
+            r#"[100, [["BTC", [[1, 3], [2]]], ["NEW", [[], []]]]]"#,
+            r#"[100, [["BTC", [[1], [2]]], ["NEW", [[3], []]]]]"#,
+            r#"[100, [["NEW", [[], []]]]]"#,
+        ] {
+            assert!(validate_snapshot_consistency(&baseline, &snapshot(json), false).is_err(), "{json}");
+        }
     }
 }
