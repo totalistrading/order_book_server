@@ -26,7 +26,7 @@ use tokio::{
     task::JoinSet,
     time::{Instant, interval_at, sleep},
 };
-use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consistency};
+use utils::{BatchQueue, EventBatch, SnapshotConsistency, process_rmp_file, validate_snapshot_consistency};
 
 mod ingestion;
 mod state;
@@ -323,6 +323,7 @@ struct ResourceStats {
     source_gaps: u64,
     snapshot_failures: u64,
     snapshot_reloads: u64,
+    empty_book_refreshes: u64,
     last_snapshot_reload_reason: Option<String>,
     pending_file_bytes: u64,
     dirty_files: usize,
@@ -340,6 +341,7 @@ impl ResourceStats {
         source_gaps: 0,
         snapshot_failures: 0,
         snapshot_reloads: 0,
+        empty_book_refreshes: 0,
         last_snapshot_reload_reason: None,
         pending_file_bytes: 0,
         dirty_files: 0,
@@ -587,21 +589,36 @@ impl OrderBookListener {
         }
 
         info!("Validating snapshot");
-        if let Err(err) =
-            validate_snapshot_consistency(&state.compute_snapshot().snapshot, &expected_snapshot, self.ignore_spot)
-        {
+        let baseline = state.compute_snapshot();
+        let consistency = validate_snapshot_consistency(&baseline.snapshot, &expected_snapshot, self.ignore_spot);
+        if matches!(consistency, Ok(SnapshotConsistency::Equal)) {
+            return Ok(());
+        }
+        let empty_additions = matches!(consistency, Ok(SnapshotConsistency::EmptyBooksAdded));
+        if let Err(err) = &consistency {
             self.stats.last_snapshot_reload_reason = Some(err.to_string().chars().take(512).collect());
             warn!("Snapshot diverged ({err}); reloading authoritative node snapshot");
-            let mut recovered = OrderBookState::from_snapshot(expected_snapshot, height, 0, true, self.ignore_spot);
-            while let Some((order_statuses, order_diffs)) = cache.pop_front() {
-                recovered.apply_updates(order_statuses, order_diffs)?;
+        }
+        // Empty additions preserve every existing order at the same proven height.
+        // Retain its source time; replay later cached updates before committing.
+        let time = if empty_additions { baseline.time } else { 0 };
+        let mut recovered = OrderBookState::from_snapshot(expected_snapshot, height, time, true, self.ignore_spot);
+        while let Some((order_statuses, order_diffs)) = cache.pop_front() {
+            recovered.apply_updates(order_statuses, order_diffs)?;
+        }
+        self.order_book_state = Some(recovered);
+        if empty_additions {
+            self.stats.empty_book_refreshes += 1;
+            if let Some((time, height, l2_snapshots)) = self.l2_snapshots(true) {
+                if let Some(tx) = &self.internal_message_tx {
+                    let _unused = tx.send(Arc::new(InternalMessage::Snapshot { l2_snapshots, time, height }));
+                }
             }
-            self.order_book_state = Some(recovered);
+        } else {
             self.stats.snapshot_reloads += 1;
             if let Some(tx) = &self.internal_message_tx {
                 let _unused = tx.send(Arc::new(InternalMessage::Gap));
             }
-            info!("Order book recovered from node snapshot");
         }
         Ok(())
     }
@@ -716,16 +733,57 @@ mod tests {
     use crate::order_book::multi_book::load_snapshots_from_str;
 
     #[test]
-    fn reloads_snapshot_when_a_market_is_added() -> Result<()> {
-        let mut listener = OrderBookListener::new(None, false);
+    fn adds_empty_market_without_resetting_existing_consumers() -> Result<()> {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let mut listener = OrderBookListener::new(Some(tx), false);
         listener.order_book_state =
-            Some(OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 100, 0, true, false));
+            Some(OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 100, 1234, true, false));
         let (_, expected) =
             load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(r#"[100, [["NEW", [[], []]]]]"#)?;
 
         listener.reconcile_snapshot(listener.clone_state(), expected, 100, VecDeque::new())?;
 
         assert!(listener.universe().contains(&Coin::new("NEW")));
+        assert_eq!(listener.compute_snapshot().unwrap().time, 1234);
+        assert_eq!(listener.stats.empty_book_refreshes, 1);
+        assert_eq!(listener.stats.snapshot_reloads, 0);
+        let update = rx.try_recv().unwrap();
+        let InternalMessage::Snapshot { l2_snapshots, time, height } = update.as_ref() else {
+            panic!("empty additions must publish a snapshot, not a gap");
+        };
+        assert!(l2_snapshots.as_ref().contains_key(&Coin::new("NEW")));
+        assert_eq!((*height, *time), (100, 1234));
+        assert!(rx.try_recv().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn empty_addition_replays_updates_before_preserving_consumers() -> Result<()> {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let mut listener = OrderBookListener::new(Some(tx), false);
+        let baseline = OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 100, 1234, true, false);
+        let record =
+            r#"{"local_time":"2026-09-11T00:00:01","block_time":"2026-09-11T00:00:01","block_number":101,"events":[]}"#;
+        let statuses: Batch<NodeDataOrderStatus> = serde_json::from_str(record)?;
+        let diffs: Batch<NodeDataOrderDiff> = serde_json::from_str(record)?;
+        let mut live = baseline.clone();
+        live.apply_updates(statuses.clone(), diffs.clone())?;
+        let expected_time = live.compute_snapshot().time;
+        listener.order_book_state = Some(live);
+        let (_, expected) =
+            load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(r#"[100, [["NEW", [[], []]]]]"#)?;
+        listener.reconcile_snapshot(Some(baseline), expected, 100, VecDeque::from([(statuses, diffs)]))?;
+        let result = listener.compute_snapshot().unwrap();
+        assert_eq!((result.height, result.time), (101, expected_time));
+        assert!(listener.universe().contains(&Coin::new("NEW")));
+        assert_eq!(listener.stats.empty_book_refreshes, 1);
+        let update = rx.try_recv().unwrap();
+        let InternalMessage::Snapshot { l2_snapshots, time, height } = update.as_ref() else {
+            panic!("empty additions must publish a snapshot, not a gap");
+        };
+        assert!(l2_snapshots.as_ref().contains_key(&Coin::new("NEW")));
+        assert_eq!((*height, *time), (101, expected_time));
+        assert!(rx.try_recv().is_err());
         Ok(())
     }
 
