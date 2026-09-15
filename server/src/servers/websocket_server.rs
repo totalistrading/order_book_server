@@ -13,12 +13,13 @@ use crate::{
     },
 };
 use axum::{Router, response::IntoResponse, routing::get};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use log::{error, info};
 use std::{
     collections::{HashMap, HashSet},
     env::home_dir,
     sync::Arc,
+    time::Duration,
 };
 use tokio::select;
 use tokio::{
@@ -99,7 +100,9 @@ fn ws_handler(
             }
         };
 
-        handle_socket(ws, internal_message_tx, listener, ignore_spot).await
+        if let Err(err) = handle_socket(ws, internal_message_tx, listener, ignore_spot).await {
+            error!("Book stream connection terminated: {err}");
+        }
     });
 
     resp
@@ -110,7 +113,7 @@ async fn handle_socket(
     internal_message_tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
     ignore_spot: bool,
-) {
+) -> Result<()> {
     let mut internal_message_rx = internal_message_tx.subscribe();
     let is_ready = listener.lock().await.is_ready();
     let mut manager = SubscriptionManager::default();
@@ -118,8 +121,8 @@ async fn handle_socket(
     let mut universe = listener.lock().await.universe().into_iter().map(|c| c.value()).collect();
     if !is_ready {
         let msg = ServerResponse::Error("Order book not ready for streaming (waiting for snapshot)".to_string());
-        send_socket_message(&mut socket, msg).await;
-        return;
+        send_socket_message(&mut socket, msg).await?;
+        return Ok(());
     }
     loop {
         select! {
@@ -129,25 +132,25 @@ async fn handle_socket(
                         match msg.as_ref() {
                             InternalMessage::Gap => {
                                 // A consumer must resubscribe to an authoritative snapshot.
-                                send_socket_message(&mut socket, ServerResponse::Error("Source gap; resnapshot required".into())).await;
-                                return;
+                                send_socket_message(&mut socket, ServerResponse::Error("Source gap; resnapshot required".into())).await?;
+                                return Ok(());
                             }
                             InternalMessage::Snapshot{ l2_snapshots, time, height } => {
                                 universe = new_universe(l2_snapshots, ignore_spot);
                                 for sub in manager.subscriptions() {
-                                    send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time, *height, &mut sent_positions).await;
+                                    send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time, *height, &mut sent_positions).await?;
                                 }
                             },
                             InternalMessage::Fills{ batch } => {
                                 let mut trades = coin_to_trades(batch);
                                 for sub in manager.subscriptions() {
-                                    send_ws_data_from_trades(&mut socket, sub, &mut trades).await;
+                                    send_ws_data_from_trades(&mut socket, sub, &mut trades).await?;
                                 }
                             },
                             InternalMessage::L4BookUpdates{ diff_batch, status_batch } => {
                                 let mut book_updates = coin_to_book_updates(diff_batch, status_batch);
                                 for sub in manager.subscriptions() {
-                                    send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await;
+                                    send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await?;
                                 }
                             },
                         }
@@ -155,7 +158,7 @@ async fn handle_socket(
                     }
                     Err(err) => {
                         error!("Receiver error: {err}");
-                        return;
+                        return Ok(());
                     }
                 }
             }
@@ -169,29 +172,29 @@ async fn handle_socket(
                                 Err(err) => {
                                     log::warn!("unable to parse websocket content: {err}: {:?}", frame.payload.as_ref());
                                     // deserves to close the connection because the payload is not a valid utf8 string.
-                                    return;
+                                    return Ok(());
                                 }
                             };
 
                             info!("Client message: {text}");
 
                             if let Ok(value) = serde_json::from_str::<ClientMessage>(text) {
-                                receive_client_message(&mut socket, &mut manager, value, &universe, listener.clone(), &mut sent_positions).await;
+                                receive_client_message(&mut socket, &mut manager, value, &universe, listener.clone(), &mut sent_positions).await?;
                             }
                             else {
                                 let msg = ServerResponse::Error(format!("Error parsing JSON into valid websocket request: {text}"));
-                                send_socket_message(&mut socket, msg).await;
+                                send_socket_message(&mut socket, msg).await?;
                             }
                         }
                         OpCode::Close => {
                             info!("Client disconnected");
-                            return;
+                            return Ok(());
                         }
                         _ => {}
                     }
                 } else {
                     info!("Client connection closed");
-                    return;
+                    return Ok(());
                 }
             }
         }
@@ -205,7 +208,7 @@ async fn receive_client_message(
     universe: &HashSet<String>,
     listener: Arc<Mutex<OrderBookListener>>,
     sent_positions: &mut HashMap<String, u64>,
-) {
+) -> Result<()> {
     let subscription = match &client_message {
         ClientMessage::Unsubscribe { subscription } | ClientMessage::Subscribe { subscription } => subscription.clone(),
     };
@@ -213,8 +216,8 @@ async fn receive_client_message(
     let sub = serde_json::to_string(&subscription).unwrap_or_default();
     if !subscription.validate(universe) {
         let msg = ServerResponse::Error(format!("Invalid subscription: {sub}"));
-        send_socket_message(socket, msg).await;
-        return;
+        send_socket_message(socket, msg).await?;
+        return Ok(());
     }
     let (word, success) = match &client_message {
         ClientMessage::Subscribe { .. } => ("", manager.subscribe(subscription)),
@@ -228,8 +231,8 @@ async fn receive_client_message(
                 Err(err) => {
                     manager.unsubscribe(subscription.clone());
                     let msg = ServerResponse::Error(format!("Unable to grab order book snapshot: {err}"));
-                    send_socket_message(socket, msg).await;
-                    return;
+                    send_socket_message(socket, msg).await?;
+                    return Ok(());
                 }
             }
         } else {
@@ -237,31 +240,34 @@ async fn receive_client_message(
             None
         };
         let msg = ServerResponse::SubscriptionResponse(client_message);
-        send_socket_message(socket, msg).await;
+        send_socket_message(socket, msg).await?;
         if let Some(snapshot_msg) = snapshot_msg {
             if let ServerResponse::L2Book(book) = &snapshot_msg {
                 sent_positions.insert(sub, book.height());
             }
-            send_socket_message(socket, snapshot_msg).await;
+            send_socket_message(socket, snapshot_msg).await?;
         }
     } else {
         let msg = ServerResponse::Error(format!("Already {word}subscribed: {sub}"));
-        send_socket_message(socket, msg).await;
+        send_socket_message(socket, msg).await?;
     }
+    Ok(())
 }
 
-async fn send_socket_message(socket: &mut WebSocket, msg: ServerResponse) {
-    let msg = serde_json::to_string(&msg);
-    match msg {
-        Ok(msg) => {
-            if let Err(err) = socket.send(FrameView::text(msg)).await {
-                error!("Failed to send: {err}");
-            }
-        }
-        Err(err) => {
-            error!("Server response serialization error: {err}");
-        }
-    }
+// A cancelled send may have written part of a frame. Its caller must drop
+// the connection on any error; never continue publishing on that socket.
+const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn send_socket_message<S>(socket: &mut S, msg: ServerResponse) -> Result<()>
+where
+    S: Sink<FrameView> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let msg = serde_json::to_string(&msg)?;
+    tokio::time::timeout(SOCKET_WRITE_TIMEOUT, socket.send(FrameView::text(msg)))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Book stream write exceeded 2 seconds"))??;
+    Ok(())
 }
 
 // derive it from l2_snapshots because thats convenient
@@ -280,12 +286,12 @@ async fn send_ws_data_from_snapshot(
     time: u64,
     height: u64,
     sent_positions: &mut HashMap<String, u64>,
-) {
+) -> Result<()> {
     // Immediate subscription snapshots can overtake already queued broadcasts.
     // Suppress only duplicates/older positions for that exact subscription.
     let key = serde_json::to_string(subscription).unwrap_or_default();
     if sent_positions.get(&key).is_some_and(|previous| height <= *previous) {
-        return;
+        return Ok(());
     }
     sent_positions.insert(key, height);
     if let Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } = subscription {
@@ -298,7 +304,7 @@ async fn send_ws_data_from_snapshot(
             let snapshot = snapshot.export_inner_snapshot();
             let l2_book = L2Book::from_l2_snapshot(coin.clone(), snapshot, time, height);
             let msg = ServerResponse::L2Book(l2_book);
-            send_socket_message(socket, msg).await;
+            send_socket_message(socket, msg).await?;
         } else if is_hip4_coin(coin) {
             // A missing HIP-4 native book is empty at this completed snapshot,
             // including on quiet blocks; never leave its previous levels alive.
@@ -306,11 +312,12 @@ async fn send_ws_data_from_snapshot(
                 socket,
                 ServerResponse::L2Book(L2Book::from_l2_snapshot(coin.clone(), [Vec::new(), Vec::new()], time, height)),
             )
-            .await;
+            .await?;
         } else {
             error!("Coin {coin} not found");
         }
     }
+    Ok(())
 }
 
 fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
@@ -361,26 +368,28 @@ async fn send_ws_data_from_book_updates(
     socket: &mut WebSocket,
     subscription: &Subscription,
     book_updates: &mut HashMap<String, L4BookUpdates>,
-) {
+) -> Result<()> {
     if let Subscription::L4Book { coin } = subscription {
         if let Some(updates) = book_updates.remove(coin) {
             let msg = ServerResponse::L4Book(L4Book::Updates(updates));
-            send_socket_message(socket, msg).await;
+            send_socket_message(socket, msg).await?;
         }
     }
+    Ok(())
 }
 
 async fn send_ws_data_from_trades(
     socket: &mut WebSocket,
     subscription: &Subscription,
     trades: &mut HashMap<String, Vec<Trade>>,
-) {
+) -> Result<()> {
     if let Subscription::Trades { coin } = subscription {
         if let Some(trades) = trades.remove(coin) {
             let msg = ServerResponse::Trades(trades);
-            send_socket_message(socket, msg).await;
+            send_socket_message(socket, msg).await?;
         }
     }
+    Ok(())
 }
 
 impl Subscription {
@@ -434,5 +443,78 @@ impl Subscription {
             return Err("Snapshot Failed".into());
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    #[derive(Default)]
+    struct TestSocket {
+        blocked: bool,
+        broken: bool,
+        sent: usize,
+    }
+
+    impl Sink<FrameView> for TestSocket {
+        type Error = io::Error;
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn start_send(mut self: Pin<&mut Self>, _: FrameView) -> io::Result<()> {
+            self.sent += 1;
+            Ok(())
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.broken {
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "test disconnected peer")))
+            } else if self.blocked {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+        fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn broken_write_propagates_instead_of_continuing_the_batch() {
+        let mut socket = TestSocket { broken: true, ..Default::default() };
+        let batch = async {
+            for _ in 0..10 {
+                send_socket_message(&mut socket, ServerResponse::Error("test".into())).await?;
+            }
+            Ok::<(), Error>(())
+        }
+        .await;
+        assert!(batch.is_err());
+        assert_eq!(socket.sent, 1);
+    }
+
+    #[tokio::test]
+    async fn blocked_flush_expires_while_another_connection_keeps_working() {
+        let mut blocked = TestSocket { blocked: true, ..Default::default() };
+        let mut healthy = TestSocket::default();
+        let (stalled_result, healthy_result) = tokio::join!(
+            send_socket_message(&mut blocked, ServerResponse::Error("blocked".into())),
+            tokio::time::timeout(Duration::from_millis(100), async {
+                for _ in 0..10 {
+                    send_socket_message(&mut healthy, ServerResponse::Error("healthy".into())).await?;
+                }
+                Ok::<(), Error>(())
+            })
+        );
+        let error = stalled_result.unwrap_err();
+        assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), io::ErrorKind::TimedOut);
+        assert!(healthy_result.unwrap().is_ok());
+        assert_eq!(healthy.sent, 10);
+        assert_eq!(blocked.sent, 1);
     }
 }
