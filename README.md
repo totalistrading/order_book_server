@@ -51,9 +51,10 @@ The WebSocket server comes with compression built-in. The compression ratio can 
 
 The shared native server admits at most 256 WebSocket connections and 2048
 subscriptions per connection. L2 depths must be 1–100 except explicit 20 (use null for that default); zero is rejected.
-Commands are limited to 4KiB and encoded output frames to 16MiB. Source/queued
-positions more than three seconds from wall clock terminate the connection;
-clients must reconnect and install a new snapshot. The existing two-second write
+Coin identifiers are limited to 64 bytes. Commands are limited to 4KiB and encoded output frames to 16MiB. Attempting to send source
+positions more than three seconds from wall clock terminates the connection;
+clients must reconnect and install a new snapshot. This send-time check does not
+claim that an idle source is periodically probed; the gateway owns that liveness check. The existing two-second write
 deadline and explicit source-gap/lag disconnect behavior remain enforced. Trade
 and L4 event loss is never hidden by coalescing.
 

@@ -208,7 +208,7 @@ async fn handle_socket(
                             info!("Client message: {text}");
 
                             if let Ok(value) = serde_json::from_str::<ClientMessage>(text) {
-                                receive_client_message(&mut socket, &mut manager, value, &universe, listener.clone(), &mut sent_positions).await?;
+                                receive_client_message(&mut socket, &mut manager, value, &universe, listener.clone(), &mut sent_positions, &wire_cache).await?;
                             }
                             else {
                                 let msg = ServerResponse::Error(format!("Error parsing JSON into valid websocket request: {text}"));
@@ -237,6 +237,7 @@ async fn receive_client_message(
     universe: &HashSet<String>,
     listener: Arc<Mutex<OrderBookListener>>,
     sent_positions: &mut HashMap<String, u64>,
+    wire_cache: &std::sync::Mutex<BookWireCache>,
 ) -> Result<()> {
     let subscription = match &client_message {
         ClientMessage::Unsubscribe { subscription } | ClientMessage::Subscribe { subscription } => subscription.clone(),
@@ -260,6 +261,30 @@ async fn receive_client_message(
         ClientMessage::Unsubscribe { .. } => ("un", manager.unsubscribe(subscription)),
     };
     if success {
+        if let ClientMessage::Subscribe { subscription: selection @ Subscription::L2Book { .. } } = &client_message {
+            let snapshot = listener.lock().await.compute_l2_snapshot();
+            if let Some((time, height, snapshots)) = snapshot {
+                if require_recent_source(time).is_ok() {
+                    send_socket_message(socket, ServerResponse::SubscriptionResponse(client_message)).await?;
+                    let selection: Subscription = serde_json::from_str(&sub)?;
+                    send_ws_data_from_snapshot(
+                        socket,
+                        &selection,
+                        &snapshots,
+                        time,
+                        height,
+                        sent_positions,
+                        wire_cache,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+            manager.unsubscribe(selection.clone());
+            send_socket_message(socket, ServerResponse::Error("Unable to grab fresh order book snapshot".into()))
+                .await?;
+            return Ok(());
+        }
         let snapshot_msg = if let ClientMessage::Subscribe { subscription } = &client_message {
             let msg = subscription.handle_immediate_snapshot(listener).await;
             match msg {

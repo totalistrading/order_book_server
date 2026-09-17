@@ -33,6 +33,12 @@ pub(crate) enum Subscription {
 
 impl Subscription {
     pub(crate) fn validate(&self, universe: &HashSet<String>) -> bool {
+        let coin = match self {
+            Self::Trades { coin } | Self::L2Book { coin, .. } | Self::L4Book { coin } => coin,
+        };
+        if coin.len() > 64 {
+            return false;
+        }
         match self {
             Self::Trades { coin } => universe.contains(coin) || is_hip4_coin(coin),
             Self::L2Book { coin, n_sig_figs, n_levels, mantissa } => {
@@ -118,6 +124,12 @@ mod test {
     use crate::types::subscription::{Subscription, is_hip4_coin};
 
     use super::{ClientMessage, ServerResponse};
+
+    #[test]
+    fn oversized_coin_is_rejected() {
+        let sub = Subscription::Trades { coin: format!("#{}", "1".repeat(4096)) };
+        assert!(!sub.validate(&HashSet::new()));
+    }
 
     #[test]
     fn subscription_capacity_and_zero_depth_are_rejected() {
