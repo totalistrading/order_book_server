@@ -264,7 +264,12 @@ async fn receive_client_message(
         if let ClientMessage::Subscribe { subscription: selection @ Subscription::L2Book { .. } } = &client_message {
             let snapshot = listener.lock().await.compute_l2_snapshot();
             if let Some((time, height, snapshots)) = snapshot {
-                if require_recent_source(time).is_ok() {
+                let has_view = wire_cache
+                    .lock()
+                    .map_err(|_| "Book wire cache poisoned")?
+                    .get(selection, &snapshots, time, height)?
+                    .is_some();
+                if has_view && require_recent_source(time).is_ok() {
                     send_socket_message(socket, ServerResponse::SubscriptionResponse(client_message)).await?;
                     let selection: Subscription = serde_json::from_str(&sub)?;
                     send_ws_data_from_snapshot(
