@@ -1,6 +1,6 @@
 use crate::{
     listeners::order_book::{
-        InternalMessage, L2SnapshotMap, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots, hl_listen,
+        InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots, hl_listen,
     },
     order_book::Coin,
     prelude::*,
@@ -8,7 +8,8 @@ use crate::{
         L2Book, L4Book, L4BookUpdates, L4Order, Trade,
         node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
         subscription::{
-            ClientMessage, DEFAULT_LEVELS, ServerResponse, Subscription, SubscriptionManager, is_hip4_coin,
+            ClientMessage, DEFAULT_LEVELS, MAX_SUBSCRIPTIONS, ServerResponse, Subscription, SubscriptionManager,
+            is_hip4_coin,
         },
     },
 };
@@ -19,13 +20,13 @@ use std::{
     collections::{HashMap, HashSet},
     env::home_dir,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::select;
 use tokio::{
     net::TcpListener,
     sync::{
-        Mutex,
+        Mutex, Semaphore,
         broadcast::{Sender, channel},
     },
 };
@@ -33,6 +34,8 @@ use yawc::{FrameView, OpCode, WebSocket};
 
 pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_level: u32) -> Result<()> {
     let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(100);
+    let connections = Arc::new(Semaphore::new(256));
+    let wire_cache = Arc::new(std::sync::Mutex::new(BookWireCache::default()));
 
     // Central task: listen to messages and forward them for distribution
     let home_dir = home_dir().ok_or("Could not find home directory")?;
@@ -67,7 +70,15 @@ pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_
             get({
                 let internal_message_tx = internal_message_tx.clone();
                 async move |ws_upgrade| {
-                    ws_handler(ws_upgrade, internal_message_tx.clone(), listener.clone(), ignore_spot, websocket_opts)
+                    ws_handler(
+                        ws_upgrade,
+                        internal_message_tx.clone(),
+                        listener.clone(),
+                        ignore_spot,
+                        websocket_opts,
+                        connections.clone(),
+                        wire_cache.clone(),
+                    )
                 }
             }),
         );
@@ -89,23 +100,33 @@ fn ws_handler(
     listener: Arc<Mutex<OrderBookListener>>,
     ignore_spot: bool,
     websocket_opts: yawc::Options,
-) -> impl IntoResponse {
+    connections: Arc<Semaphore>,
+    wire_cache: Arc<std::sync::Mutex<BookWireCache>>,
+) -> axum::response::Response {
+    let Ok(permit) = connections.try_acquire_owned() else {
+        return (axum::http::StatusCode::TOO_MANY_REQUESTS, "Connection capacity reached").into_response();
+    };
     let (resp, fut) = incoming.upgrade(websocket_opts).unwrap();
     tokio::spawn(async move {
-        let ws = match fut.await {
-            Ok(ok) => ok,
-            Err(err) => {
+        let _permit = permit;
+        let ws = match tokio::time::timeout(std::time::Duration::from_secs(5), fut).await {
+            Ok(Ok(ok)) => ok,
+            Ok(Err(err)) => {
                 log::error!("failed to upgrade websocket connection: {err}");
+                return;
+            }
+            Err(_) => {
+                log::warn!("websocket upgrade deadline exceeded");
                 return;
             }
         };
 
-        if let Err(err) = handle_socket(ws, internal_message_tx, listener, ignore_spot).await {
+        if let Err(err) = handle_socket(ws, internal_message_tx, listener, ignore_spot, wire_cache).await {
             error!("Book stream connection terminated: {err}");
         }
     });
 
-    resp
+    resp.into_response()
 }
 
 async fn handle_socket(
@@ -113,6 +134,7 @@ async fn handle_socket(
     internal_message_tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
     ignore_spot: bool,
+    wire_cache: Arc<std::sync::Mutex<BookWireCache>>,
 ) -> Result<()> {
     let mut internal_message_rx = internal_message_tx.subscribe();
     let is_ready = listener.lock().await.is_ready();
@@ -138,18 +160,22 @@ async fn handle_socket(
                             InternalMessage::Snapshot{ l2_snapshots, time, height } => {
                                 universe = new_universe(l2_snapshots, ignore_spot);
                                 for sub in manager.subscriptions() {
-                                    send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time, *height, &mut sent_positions).await?;
+                                    send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots, *time, *height, &mut sent_positions, &wire_cache).await?;
                                 }
                             },
                             InternalMessage::Fills{ batch } => {
+                                require_recent_source(batch.block_time())?;
                                 let mut trades = coin_to_trades(batch);
                                 for sub in manager.subscriptions() {
+                                    require_recent_source(batch.block_time())?;
                                     send_ws_data_from_trades(&mut socket, sub, &mut trades).await?;
                                 }
                             },
                             InternalMessage::L4BookUpdates{ diff_batch, status_batch } => {
+                                require_recent_source(diff_batch.block_time())?;
                                 let mut book_updates = coin_to_book_updates(diff_batch, status_batch);
                                 for sub in manager.subscriptions() {
+                                    require_recent_source(diff_batch.block_time())?;
                                     send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await?;
                                 }
                             },
@@ -167,6 +193,9 @@ async fn handle_socket(
                 if let Some(frame) = msg {
                     match frame.opcode {
                         OpCode::Text => {
+                            if frame.payload.len() > 4096 {
+                                return Err("Subscription request exceeds 4096 bytes".into());
+                            }
                             let text = match std::str::from_utf8(&frame.payload) {
                                 Ok(text) => text,
                                 Err(err) => {
@@ -179,7 +208,7 @@ async fn handle_socket(
                             info!("Client message: {text}");
 
                             if let Ok(value) = serde_json::from_str::<ClientMessage>(text) {
-                                receive_client_message(&mut socket, &mut manager, value, &universe, listener.clone(), &mut sent_positions).await?;
+                                receive_client_message(&mut socket, &mut manager, value, &universe, listener.clone(), &mut sent_positions, &wire_cache).await?;
                             }
                             else {
                                 let msg = ServerResponse::Error(format!("Error parsing JSON into valid websocket request: {text}"));
@@ -208,12 +237,20 @@ async fn receive_client_message(
     universe: &HashSet<String>,
     listener: Arc<Mutex<OrderBookListener>>,
     sent_positions: &mut HashMap<String, u64>,
+    wire_cache: &std::sync::Mutex<BookWireCache>,
 ) -> Result<()> {
     let subscription = match &client_message {
         ClientMessage::Unsubscribe { subscription } | ClientMessage::Subscribe { subscription } => subscription.clone(),
     };
     // this is used for display purposes only, hence unwrap_or_default. It also shouldn't fail
     let sub = serde_json::to_string(&subscription).unwrap_or_default();
+    if matches!(client_message, ClientMessage::Subscribe { .. })
+        && manager.subscriptions().len() >= MAX_SUBSCRIPTIONS
+        && !manager.subscriptions().contains(&subscription)
+    {
+        send_socket_message(socket, ServerResponse::Error("Subscription capacity reached".into())).await?;
+        return Ok(());
+    }
     if !subscription.validate(universe) {
         let msg = ServerResponse::Error(format!("Invalid subscription: {sub}"));
         send_socket_message(socket, msg).await?;
@@ -224,6 +261,35 @@ async fn receive_client_message(
         ClientMessage::Unsubscribe { .. } => ("un", manager.unsubscribe(subscription)),
     };
     if success {
+        if let ClientMessage::Subscribe { subscription: selection @ Subscription::L2Book { .. } } = &client_message {
+            let snapshot = listener.lock().await.compute_l2_snapshot();
+            if let Some((time, height, snapshots)) = snapshot {
+                let has_view = wire_cache
+                    .lock()
+                    .map_err(|_| "Book wire cache poisoned")?
+                    .get(selection, &snapshots, time, height)?
+                    .is_some();
+                if has_view && require_recent_source(time).is_ok() {
+                    send_socket_message(socket, ServerResponse::SubscriptionResponse(client_message)).await?;
+                    let selection: Subscription = serde_json::from_str(&sub)?;
+                    send_ws_data_from_snapshot(
+                        socket,
+                        &selection,
+                        &snapshots,
+                        time,
+                        height,
+                        sent_positions,
+                        wire_cache,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+            manager.unsubscribe(selection.clone());
+            send_socket_message(socket, ServerResponse::Error("Unable to grab fresh order book snapshot".into()))
+                .await?;
+            return Ok(());
+        }
         let snapshot_msg = if let ClientMessage::Subscribe { subscription } = &client_message {
             let msg = subscription.handle_immediate_snapshot(listener).await;
             match msg {
@@ -257,6 +323,15 @@ async fn receive_client_message(
 // A cancelled send may have written part of a frame. Its caller must drop
 // the connection on any error; never continue publishing on that socket.
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_WIRE_BYTES: usize = 16 * 1024 * 1024;
+
+fn require_recent_source(time_ms: u64) -> Result<()> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    if now.abs_diff(u128::from(time_ms)) > 3000 {
+        return Err("Source/queue age exceeded 3 seconds; resnapshot required".into());
+    }
+    Ok(())
+}
 
 async fn send_socket_message<S>(socket: &mut S, msg: ServerResponse) -> Result<()>
 where
@@ -264,6 +339,9 @@ where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
     let msg = serde_json::to_string(&msg)?;
+    if msg.len() > MAX_WIRE_BYTES {
+        return Err("Book stream frame exceeds 16 MiB; resnapshot required".into());
+    }
     tokio::time::timeout(SOCKET_WRITE_TIMEOUT, socket.send(FrameView::text(msg)))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Book stream write exceeded 2 seconds"))??;
@@ -279,43 +357,95 @@ fn new_universe(l2_snapshots: &L2Snapshots, ignore_spot: bool) -> HashSet<String
         .collect()
 }
 
+#[derive(Default)]
+struct BookWireCache {
+    position: Option<(usize, u64, u64)>,
+    source: Option<L2Snapshots>,
+    entries: HashMap<Subscription, Arc<str>>,
+    bytes: usize,
+}
+
+impl BookWireCache {
+    fn get(
+        &mut self,
+        subscription: &Subscription,
+        snapshots: &L2Snapshots,
+        time: u64,
+        height: u64,
+    ) -> Result<Option<Arc<str>>> {
+        let Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } = subscription else {
+            return Ok(None);
+        };
+        let position = (std::ptr::from_ref(snapshots.as_ref()) as usize, time, height);
+        let cacheable =
+            self.position.is_none_or(|(_, cached_time, cached_height)| height >= cached_height && time >= cached_time);
+        if cacheable && self.position != Some(position) {
+            self.position = Some(position);
+            // Retain the source Arc so an allocation address cannot be reused
+            // as another view with the same height while cached bytes survive.
+            self.source = Some(snapshots.clone());
+            self.entries.clear();
+            self.bytes = 0;
+        }
+        if self.position == Some(position) {
+            if let Some(encoded) = self.entries.get(subscription) {
+                return Ok(Some(encoded.clone()));
+            }
+        }
+        let levels = match snapshots
+            .as_ref()
+            .get(&Coin::new(coin))
+            .and_then(|v| v.get(&L2SnapshotParams::new(*n_sig_figs, *mantissa)))
+        {
+            Some(snapshot) => snapshot.truncate(n_levels.unwrap_or(DEFAULT_LEVELS)).export_inner_snapshot(),
+            None if is_hip4_coin(coin) => [Vec::new(), Vec::new()],
+            None => return Ok(None),
+        };
+        let encoded: Arc<str> = serde_json::to_string(&ServerResponse::L2Book(L2Book::from_l2_snapshot(
+            coin.clone(),
+            levels,
+            time,
+            height,
+        )))?
+        .into();
+        if encoded.len() > MAX_WIRE_BYTES {
+            return Err("Book frame exceeds byte bound".into());
+        }
+        // One cache shared by all sockets, not a cache per subscriber or block.
+        if cacheable && self.bytes + encoded.len() <= 2 * 1024 * 1024 && self.entries.len() < 1024 {
+            self.bytes += encoded.len();
+            self.entries.insert(subscription.clone(), encoded.clone());
+        }
+        Ok(Some(encoded))
+    }
+}
+
 async fn send_ws_data_from_snapshot(
     socket: &mut WebSocket,
     subscription: &Subscription,
-    snapshot: &L2SnapshotMap,
+    snapshots: &L2Snapshots,
     time: u64,
     height: u64,
     sent_positions: &mut HashMap<String, u64>,
+    cache: &std::sync::Mutex<BookWireCache>,
 ) -> Result<()> {
-    // Immediate subscription snapshots can overtake already queued broadcasts.
-    // Suppress only duplicates/older positions for that exact subscription.
-    let key = serde_json::to_string(subscription).unwrap_or_default();
+    if !matches!(subscription, Subscription::L2Book { .. }) {
+        return Ok(());
+    }
+    require_recent_source(time)?;
+    let key = serde_json::to_string(subscription)?;
     if sent_positions.get(&key).is_some_and(|previous| height <= *previous) {
         return Ok(());
     }
-    sent_positions.insert(key, height);
-    if let Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } = subscription {
-        let snapshot = snapshot.get(&Coin::new(coin));
-        if let Some(snapshot) =
-            snapshot.and_then(|snapshot| snapshot.get(&L2SnapshotParams::new(*n_sig_figs, *mantissa)))
-        {
-            let n_levels = n_levels.unwrap_or(DEFAULT_LEVELS);
-            let snapshot = snapshot.truncate(n_levels);
-            let snapshot = snapshot.export_inner_snapshot();
-            let l2_book = L2Book::from_l2_snapshot(coin.clone(), snapshot, time, height);
-            let msg = ServerResponse::L2Book(l2_book);
-            send_socket_message(socket, msg).await?;
-        } else if is_hip4_coin(coin) {
-            // A missing HIP-4 native book is empty at this completed snapshot,
-            // including on quiet blocks; never leave its previous levels alive.
-            send_socket_message(
-                socket,
-                ServerResponse::L2Book(L2Book::from_l2_snapshot(coin.clone(), [Vec::new(), Vec::new()], time, height)),
-            )
-            .await?;
-        } else {
-            error!("Coin {coin} not found");
-        }
+    let encoded = {
+        let mut cache = cache.lock().map_err(|_| "Book wire cache poisoned")?;
+        cache.get(subscription, snapshots, time, height)?
+    };
+    if let Some(encoded) = encoded {
+        tokio::time::timeout(SOCKET_WRITE_TIMEOUT, socket.send(FrameView::text(encoded.to_string())))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Book stream write timeout"))??;
+        sent_positions.insert(key, height);
     }
     Ok(())
 }
@@ -400,6 +530,7 @@ impl Subscription {
     ) -> Result<Option<ServerResponse>> {
         if let Self::L2Book { coin, n_sig_figs, n_levels, mantissa } = self {
             if let Some((time, height, snapshots)) = listener.lock().await.compute_l2_snapshot() {
+                require_recent_source(time)?;
                 if let Some(snapshot) = snapshots
                     .as_ref()
                     .get(&Coin::new(coin))
@@ -427,6 +558,7 @@ impl Subscription {
         if let Self::L4Book { coin } = self {
             let snapshot = listener.lock().await.compute_snapshot();
             if let Some(TimedSnapshots { time, height, snapshot }) = snapshot {
+                require_recent_source(time)?;
                 let snapshot =
                     snapshot.value().into_iter().filter(|(c, _)| *c == Coin::new(coin)).collect::<Vec<_>>().pop();
                 if let Some((coin, snapshot)) = snapshot {
@@ -449,6 +581,47 @@ impl Subscription {
 #[cfg(test)]
 mod transport_tests {
     use super::*;
+
+    #[test]
+    fn shared_wire_cache_reuses_exact_view_and_advances_position() {
+        let mut cache = BookWireCache::default();
+        let snapshot = L2Snapshots::default();
+        let subscription =
+            Subscription::L2Book { coin: "#10".into(), n_sig_figs: None, n_levels: None, mantissa: None };
+        let first = cache.get(&subscription, &snapshot, 1000, 1).unwrap().unwrap();
+        let repeated = cache.get(&subscription, &snapshot, 1000, 1).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &repeated));
+        let next = cache.get(&subscription, &snapshot, 1001, 2).unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&first, &next));
+        let value: serde_json::Value = serde_json::from_str(&next).unwrap();
+        assert_eq!(value["data"]["height"], 2);
+        assert_eq!(cache.entries.len(), 1);
+        let old = cache.get(&subscription, &snapshot, 1000, 1).unwrap().unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&old).unwrap()["data"]["height"], 1);
+        let still_current = cache.get(&subscription, &snapshot, 1001, 2).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&next, &still_current));
+    }
+
+    #[test]
+    fn wire_cache_is_bounded_across_subscribed_views() {
+        let mut cache = BookWireCache::default();
+        let snapshot = L2Snapshots::default();
+        for id in 0..1100 {
+            let subscription =
+                Subscription::L2Book { coin: format!("#{id}"), n_sig_figs: None, n_levels: None, mantissa: None };
+            assert!(cache.get(&subscription, &snapshot, 1000, 1).unwrap().is_some());
+        }
+        assert_eq!(cache.entries.len(), 1024);
+        assert!(cache.bytes <= 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn source_age_rejects_stale_and_future_positions() {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        assert!(require_recent_source(now).is_ok());
+        assert!(require_recent_source(now - 4000).is_err());
+        assert!(require_recent_source(now + 4000).is_err());
+    }
     use std::{
         pin::Pin,
         task::{Context, Poll},

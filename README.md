@@ -46,3 +46,23 @@ The WebSocket server comes with compression built-in. The compression ratio can 
 - This server does **not** show untriggered trigger orders.
 - It currently **does not** support spot order books.
 - The current implementation batches node outputs by block, making the order book a few milliseconds slower than a streaming implementation.
+
+## Bounded subscriptions (TT-1508)
+
+The shared native server admits at most 256 WebSocket connections and 2048
+subscriptions per connection. L2 depths must be 1–100 except explicit 20 (use null for that default); zero is rejected.
+Coin identifiers are limited to 64 bytes. Commands are limited to 4KiB and encoded output frames to 16MiB. Attempting to send source
+positions more than three seconds from wall clock terminates the connection;
+clients must reconnect and install a new snapshot. This send-time check does not
+claim that an idle source is periodically probed; the gateway owns that liveness check. The existing two-second write
+deadline and explicit source-gap/lag disconnect behavior remain enforced. Trade
+and L4 event loss is never hidden by coalescing.
+
+A shared 2MiB/1024-entry encoded L2 cache reuses identical subscribed views across
+sockets. Its key binds the immutable snapshot allocation, height, time and all
+subscription precision/depth parameters. Source snapshots remain dirty-coin cached
+from TT-1506; wire-cache entries cannot survive a source/position change.
+
+Run `cargo +1.89.0 test --locked --workspace` on Linux (production toolchain).
+The existing directory-notification integration test can duplicate file events on
+macOS; the Linux CI runs it along with source recovery and transport tests.

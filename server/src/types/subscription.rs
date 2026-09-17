@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 const MAX_LEVELS: usize = 100;
+pub(crate) const MAX_SUBSCRIPTIONS: usize = 2048;
 pub(crate) const DEFAULT_LEVELS: usize = 20;
 
 pub(crate) fn is_hip4_coin(coin: &str) -> bool {
@@ -32,6 +33,12 @@ pub(crate) enum Subscription {
 
 impl Subscription {
     pub(crate) fn validate(&self, universe: &HashSet<String>) -> bool {
+        let coin = match self {
+            Self::Trades { coin } | Self::L2Book { coin, .. } | Self::L4Book { coin } => coin,
+        };
+        if coin.len() > 64 {
+            return false;
+        }
         match self {
             Self::Trades { coin } => universe.contains(coin) || is_hip4_coin(coin),
             Self::L2Book { coin, n_sig_figs, n_levels, mantissa } => {
@@ -44,7 +51,7 @@ impl Subscription {
                     return false;
                 }
                 let n_levels = n_levels.unwrap_or(DEFAULT_LEVELS);
-                if n_levels > MAX_LEVELS {
+                if n_levels == 0 || n_levels > MAX_LEVELS {
                     info!("Invalid subscription: n_levels too high");
                     return false;
                 }
@@ -95,6 +102,9 @@ pub(crate) struct SubscriptionManager {
 
 impl SubscriptionManager {
     pub(crate) fn subscribe(&mut self, sub: Subscription) -> bool {
+        if self.subscriptions.len() >= MAX_SUBSCRIPTIONS && !self.subscriptions.contains(&sub) {
+            return false;
+        }
         self.subscriptions.insert(sub)
     }
 
@@ -114,6 +124,27 @@ mod test {
     use crate::types::subscription::{Subscription, is_hip4_coin};
 
     use super::{ClientMessage, ServerResponse};
+
+    #[test]
+    fn oversized_coin_is_rejected() {
+        let sub = Subscription::Trades { coin: format!("#{}", "1".repeat(4096)) };
+        assert!(!sub.validate(&HashSet::new()));
+    }
+
+    #[test]
+    fn subscription_capacity_and_zero_depth_are_rejected() {
+        let mut manager = super::SubscriptionManager::default();
+        for id in 0..super::MAX_SUBSCRIPTIONS {
+            assert!(manager.subscribe(Subscription::Trades { coin: format!("#{id}") }));
+        }
+        assert!(!manager.subscribe(Subscription::Trades { coin: "BTC".into() }));
+        assert!(manager.unsubscribe(Subscription::Trades { coin: "#0".into() }));
+        assert!(manager.subscribe(Subscription::Trades { coin: "BTC".into() }));
+        assert!(
+            !Subscription::L2Book { coin: "BTC".into(), n_levels: Some(0), n_sig_figs: None, mantissa: None }
+                .validate(&HashSet::from(["BTC".into()]))
+        );
+    }
 
     #[test]
     fn test_message_deserialization_subscription_response() {
