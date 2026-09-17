@@ -96,7 +96,7 @@ pub(crate) struct SubscriptionManager {
 
 impl SubscriptionManager {
     pub(crate) fn subscribe(&mut self, sub: Subscription) -> bool {
-        if self.subscriptions.len() >= MAX_SUBSCRIPTIONS {
+        if self.subscriptions.len() >= MAX_SUBSCRIPTIONS && !self.subscriptions.contains(&sub) {
             return false;
         }
         self.subscriptions.insert(sub)

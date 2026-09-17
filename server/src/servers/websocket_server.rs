@@ -243,7 +243,10 @@ async fn receive_client_message(
     };
     // this is used for display purposes only, hence unwrap_or_default. It also shouldn't fail
     let sub = serde_json::to_string(&subscription).unwrap_or_default();
-    if matches!(client_message, ClientMessage::Subscribe { .. }) && manager.subscriptions().len() >= MAX_SUBSCRIPTIONS {
+    if matches!(client_message, ClientMessage::Subscribe { .. })
+        && manager.subscriptions().len() >= MAX_SUBSCRIPTIONS
+        && !manager.subscriptions().contains(&subscription)
+    {
         send_socket_message(socket, ServerResponse::Error("Subscription capacity reached".into())).await?;
         return Ok(());
     }

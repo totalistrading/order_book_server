@@ -50,7 +50,7 @@ The WebSocket server comes with compression built-in. The compression ratio can 
 ## Bounded subscriptions (TT-1508)
 
 The shared native server admits at most 256 WebSocket connections and 2048
-subscriptions per connection. L2 depths must be 1–100; zero is rejected.
+subscriptions per connection. L2 depths must be 1–100 except explicit 20 (use null for that default); zero is rejected.
 Commands are limited to 4KiB and encoded output frames to 16MiB. Source/queued
 positions more than three seconds from wall clock terminate the connection;
 clients must reconnect and install a new snapshot. The existing two-second write
