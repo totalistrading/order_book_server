@@ -109,10 +109,14 @@ fn ws_handler(
     let (resp, fut) = incoming.upgrade(websocket_opts).unwrap();
     tokio::spawn(async move {
         let _permit = permit;
-        let ws = match fut.await {
-            Ok(ok) => ok,
-            Err(err) => {
+        let ws = match tokio::time::timeout(std::time::Duration::from_secs(5), fut).await {
+            Ok(Ok(ok)) => ok,
+            Ok(Err(err)) => {
                 log::error!("failed to upgrade websocket connection: {err}");
+                return;
+            }
+            Err(_) => {
+                log::warn!("websocket upgrade deadline exceeded");
                 return;
             }
         };
