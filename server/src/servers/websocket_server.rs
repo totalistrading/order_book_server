@@ -158,7 +158,6 @@ async fn handle_socket(
                                 return Ok(());
                             }
                             InternalMessage::Snapshot{ l2_snapshots, time, height } => {
-                                require_recent_source(*time)?;
                                 universe = new_universe(l2_snapshots, ignore_spot);
                                 for sub in manager.subscriptions() {
                                     send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots, *time, *height, &mut sent_positions, &wire_cache).await?;
@@ -345,7 +344,9 @@ impl BookWireCache {
             return Ok(None);
         };
         let position = (std::ptr::from_ref(snapshots.as_ref()) as usize, time, height);
-        if self.position != Some(position) {
+        let cacheable =
+            self.position.is_none_or(|(_, cached_time, cached_height)| height >= cached_height && time >= cached_time);
+        if cacheable && self.position != Some(position) {
             self.position = Some(position);
             // Retain the source Arc so an allocation address cannot be reused
             // as another view with the same height while cached bytes survive.
@@ -353,8 +354,10 @@ impl BookWireCache {
             self.entries.clear();
             self.bytes = 0;
         }
-        if let Some(encoded) = self.entries.get(subscription) {
-            return Ok(Some(encoded.clone()));
+        if self.position == Some(position) {
+            if let Some(encoded) = self.entries.get(subscription) {
+                return Ok(Some(encoded.clone()));
+            }
         }
         let levels = match snapshots
             .as_ref()
@@ -376,7 +379,7 @@ impl BookWireCache {
             return Err("Book frame exceeds byte bound".into());
         }
         // One cache shared by all sockets, not a cache per subscriber or block.
-        if self.bytes + encoded.len() <= 2 * 1024 * 1024 && self.entries.len() < 1024 {
+        if cacheable && self.bytes + encoded.len() <= 2 * 1024 * 1024 && self.entries.len() < 1024 {
             self.bytes += encoded.len();
             self.entries.insert(subscription.clone(), encoded.clone());
         }
@@ -393,6 +396,9 @@ async fn send_ws_data_from_snapshot(
     sent_positions: &mut HashMap<String, u64>,
     cache: &std::sync::Mutex<BookWireCache>,
 ) -> Result<()> {
+    if !matches!(subscription, Subscription::L2Book { .. }) {
+        return Ok(());
+    }
     require_recent_source(time)?;
     let key = serde_json::to_string(subscription)?;
     if sent_positions.get(&key).is_some_and(|previous| height <= *previous) {
@@ -557,6 +563,10 @@ mod transport_tests {
         let value: serde_json::Value = serde_json::from_str(&next).unwrap();
         assert_eq!(value["data"]["height"], 2);
         assert_eq!(cache.entries.len(), 1);
+        let old = cache.get(&subscription, &snapshot, 1000, 1).unwrap().unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&old).unwrap()["data"]["height"], 1);
+        let still_current = cache.get(&subscription, &snapshot, 1001, 2).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&next, &still_current));
     }
 
     #[test]
