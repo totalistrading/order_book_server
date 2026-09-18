@@ -1,0 +1,80 @@
+{
+  "order_statuses": {
+    "local_time": "2026-09-18T02:36:17.800000000",
+    "block_time": "2026-09-18T02:36:17.793733913",
+    "block_number": 101,
+    "events": [
+      {
+        "time": "2026-09-18T02:36:17.793733913",
+        "user": "0x0000000000000000000000000000000000000000",
+        "status": "triggered",
+        "order": {
+          "coin": "UNI",
+          "side": "B",
+          "limitPx": "7.1973",
+          "sz": "0.0",
+          "oid": 1,
+          "timestamp": 1789698976729,
+          "triggerCondition": "Price above 7.1973",
+          "isTrigger": true,
+          "triggerPx": "7.1973",
+          "isPositionTpsl": true,
+          "reduceOnly": true,
+          "orderType": "Stop Market",
+          "tif": null,
+          "cloid": null
+        }
+      }
+    ]
+  },
+  "book_diffs": {
+    "local_time": "2026-09-18T02:36:17.800000000",
+    "block_time": "2026-09-18T02:36:17.793733913",
+    "block_number": 101,
+    "events": [
+      {
+        "user": "0x0000000000000000000000000000000000000000",
+        "oid": 1,
+        "coin": "UNI",
+        "px": "7.917",
+        "raw_book_diff": {
+          "new": {
+            "sz": "4.6"
+          }
+        }
+      }
+    ]
+  },
+  "snapshot": [
+    101,
+    [
+      [
+        "UNI",
+        [
+          [
+            [
+              "0x0000000000000000000000000000000000000000",
+              {
+                "coin": "UNI",
+                "side": "B",
+                "limitPx": "7.917",
+                "sz": "4.6",
+                "oid": 1,
+                "timestamp": 1789698977793,
+                "triggerCondition": "Triggered",
+                "isTrigger": false,
+                "triggerPx": "0.0",
+                "isPositionTpsl": true,
+                "reduceOnly": true,
+                "orderType": "Stop Market",
+                "tif": "Gtc",
+                "cloid": null
+              }
+            ]
+          ],
+          []
+        ]
+      ]
+    ]
+  ]
+}

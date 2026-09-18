@@ -5,7 +5,7 @@ use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    order_book::{Coin, Oid},
+    order_book::{Coin, Oid, Px},
     types::{Fill, L4Order, OrderDiff},
 };
 
@@ -24,6 +24,10 @@ impl NodeDataOrderDiff {
     }
     pub(crate) const fn oid(&self) -> Oid {
         Oid::new(self.oid)
+    }
+
+    pub(crate) fn price(&self) -> crate::prelude::Result<Px> {
+        Px::parse_from_str(&self.px)
     }
 
     pub(crate) fn coin(&self) -> Coin {
