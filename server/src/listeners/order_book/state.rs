@@ -104,6 +104,9 @@ impl OrderBookState {
                     if let Some(order) = order_map.remove(&oid) {
                         let time = order.time.and_utc().timestamp_millis();
                         let mut inner_order: InnerL4Order = order.try_into()?;
+                        // The status retains a trigger's original limit. The paired book
+                        // diff gives its actual resting price and size after activation.
+                        inner_order.limit_px = diff.price()?;
                         inner_order.modify_sz(sz);
                         // must replace time with time of entering book, which is the timestamp of the order status update
                         #[allow(clippy::unwrap_used)]
@@ -170,6 +173,37 @@ mod tests {
         assert!(!Arc::ptr_eq(&first.as_ref()[&Coin::new("BTC")], &updated.as_ref()[&Coin::new("BTC")]));
         assert!(Arc::ptr_eq(&first.as_ref()[&Coin::new("ETH")], &updated.as_ref()[&Coin::new("ETH")]));
     }
+    #[test]
+    fn triggered_market_order_uses_resting_diff_price_and_matches_snapshot() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!("fixtures/trigger_repriced.json")).unwrap();
+        let mut state = OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 100, 0, true, false);
+        state
+            .apply_updates(
+                serde_json::from_value(fixture["order_statuses"].clone()).unwrap(),
+                serde_json::from_value(fixture["book_diffs"].clone()).unwrap(),
+            )
+            .unwrap();
+        let (_, expected) =
+            load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&fixture["snapshot"].to_string()).unwrap();
+        let actual = state.compute_snapshot();
+        super::super::utils::validate_snapshot_consistency(&actual.snapshot, &expected, false).unwrap();
+        let (_, _, l2) = state.compute_l2_snapshot();
+        let views = &l2.as_ref()[&Coin::new("UNI")];
+        let raw = views[&super::super::L2SnapshotParams::new(None, None)].as_ref();
+        assert_eq!(raw[0][0].px, crate::order_book::Px::parse_from_str("7.917").unwrap());
+        assert_eq!(raw[0][0].sz, crate::order_book::Sz::parse_from_str("4.6").unwrap());
+        // Later removal must find the order at its authoritative resting level.
+        let mut orders = fixture["order_statuses"].clone();
+        orders["block_number"] = serde_json::json!(102);
+        orders["events"] = serde_json::json!([]);
+        let mut diffs = fixture["book_diffs"].clone();
+        diffs["block_number"] = serde_json::json!(102);
+        diffs["events"][0]["raw_book_diff"] = serde_json::json!("remove");
+        state.apply_updates(serde_json::from_value(orders).unwrap(), serde_json::from_value(diffs).unwrap()).unwrap();
+        let after = state.compute_snapshot();
+        assert!(after.snapshot.as_ref()[&Coin::new("UNI")].as_ref()[0].is_empty());
+    }
+
     fn fixture_state(coins: usize, levels: usize) -> OrderBookState {
         use crate::order_book::{Px, Side, Sz};
         let mut state = OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 100, 1000, true, false);
