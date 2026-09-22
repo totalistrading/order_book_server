@@ -227,7 +227,7 @@ async fn fetch_snapshot(dir: PathBuf, listener: Arc<Mutex<OrderBookListener>>, i
     let started = Instant::now();
     // Capture the validation baseline before asking the node for its snapshot,
     // so updates during export are available to reach that snapshot's height.
-    let (epoch, state, timeout) = {
+    let (epoch, state, timeout, request_started_at_ms) = {
         let mut listener = listener.lock().await;
         let epoch = listener.recovery_epoch;
         listener.begin_caching();
@@ -235,8 +235,9 @@ async fn fetch_snapshot(dir: PathBuf, listener: Arc<Mutex<OrderBookListener>>, i
         let state = listener.clone_state();
         listener.stats.snapshot_clone_ms = cloning.elapsed().as_millis() as u64;
         listener.stats.snapshot_requests += 1;
-        listener.stats.snapshot_request_started_at_ms = chrono::Utc::now().timestamp_millis();
-        (epoch, state, listener.limits.snapshot_timeout)
+        let request_started_at_ms = chrono::Utc::now().timestamp_millis();
+        listener.stats.snapshot_request_inflight_started_at_ms = request_started_at_ms;
+        (epoch, state, listener.limits.snapshot_timeout, request_started_at_ms)
     };
     let request_started = Instant::now();
     let response = process_rmp_file(&dir, &info_url, timeout).await;
@@ -244,8 +245,10 @@ async fn fetch_snapshot(dir: PathBuf, listener: Arc<Mutex<OrderBookListener>>, i
     let completed_at_ms = chrono::Utc::now().timestamp_millis();
     {
         let mut listener = listener.lock().await;
+        listener.stats.snapshot_request_started_at_ms = request_started_at_ms;
         listener.stats.snapshot_request_ms = request_ms;
         listener.stats.snapshot_request_completed_at_ms = completed_at_ms;
+        listener.stats.snapshot_request_inflight_started_at_ms = 0;
     }
     match response {
         Ok(output_fln) => {
@@ -363,6 +366,7 @@ struct ResourceStats {
     snapshot_request_started_at_ms: i64,
     snapshot_request_completed_at_ms: i64,
     snapshot_request_ms: u64,
+    snapshot_request_inflight_started_at_ms: i64,
 }
 
 impl ResourceStats {
@@ -385,6 +389,7 @@ impl ResourceStats {
         snapshot_request_started_at_ms: 0,
         snapshot_request_completed_at_ms: 0,
         snapshot_request_ms: 0,
+        snapshot_request_inflight_started_at_ms: 0,
     };
 }
 
@@ -1025,6 +1030,12 @@ mod recovery_integration_tests {
         };
         let task = tokio::spawn(hl_listen_with_source(listener.clone(), dir.clone(), url, limits));
         tokio::time::timeout(Duration::from_secs(10), entered.notified()).await.unwrap();
+        {
+            let state = listener.lock().await;
+            assert!(state.stats.snapshot_request_inflight_started_at_ms > 0);
+            assert_eq!(state.stats.snapshot_request_started_at_ms, 0);
+            assert_eq!(state.stats.snapshot_request_completed_at_ms, 0);
+        }
         let mut records = String::new();
         for number in 101..=164 {
             records += &format!(
@@ -1092,6 +1103,12 @@ mod recovery_integration_tests {
         .await
         .unwrap();
         assert_eq!(requests.load(AtomicOrdering::SeqCst), 3);
+        {
+            let state = listener.lock().await;
+            assert_eq!(state.stats.snapshot_request_inflight_started_at_ms, 0);
+            assert!(state.stats.snapshot_request_started_at_ms > 0);
+            assert!(state.stats.snapshot_request_completed_at_ms >= state.stats.snapshot_request_started_at_ms);
+        }
         task.abort();
         let _ = task.await;
         server.abort();

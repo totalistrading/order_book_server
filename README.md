@@ -71,9 +71,12 @@ macOS; the Linux CI runs it along with source recovery and transport tests.
 
 `BOOK_SNAPSHOT_INTERVAL_SECONDS` controls the delay after a completed routine
 snapshot audit (10–300 seconds, default 10). `/resources` exposes the configured
-interval, snapshot request count, latest request start/completion timestamps and
-HTTP request duration. Duration includes node snapshot generation and excludes
-local snapshot parsing/reconciliation.
+interval, snapshot request count, latest completed request start/completion
+timestamps and request-phase duration. Duration includes output-file/client setup
+and the HTTP request (including node snapshot generation), and excludes local
+snapshot parsing/reconciliation. The completed timing fields update atomically;
+`snapshot_request_inflight_started_at_ms` separately identifies an active request
+and is zero when none is running.
 
 Startup still requests its first snapshot after five seconds. A fenced listener
 uses the one-second maintenance loop and a ten-second retry delay after its last
