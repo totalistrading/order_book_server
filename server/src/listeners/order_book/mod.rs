@@ -81,7 +81,9 @@ async fn hl_listen_with_source(
     }
     let mut cursors = HashMap::<PathBuf, FileCursor>::new();
     let mut snapshots = JoinSet::new();
-    let mut ticker = interval_at(Instant::now() + Duration::from_secs(5), Duration::from_secs(10));
+    let first_snapshot = Instant::now() + Duration::from_secs(5);
+    let mut ticker = interval_at(first_snapshot, limits.snapshot_interval);
+    let mut recovery_retry_at = first_snapshot;
     let mut maintenance = interval_at(Instant::now() + Duration::from_secs(1), Duration::from_secs(1));
     maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -109,6 +111,13 @@ async fn hl_listen_with_source(
                 }
                 if state.order_status_cache.expired(limits) || state.order_diff_cache.expired(limits) {
                     state.fence("unmatched source queue exceeded age limit");
+                }
+                let needs_recovery = !state.is_ready();
+                drop(state);
+                // Routine full-node snapshot audits can be spaced out without
+                // making a fenced book wait for the next healthy audit.
+                if needs_recovery && snapshots.is_empty() && Instant::now() >= recovery_retry_at {
+                    snapshots.spawn(fetch_snapshot(dir.clone(), listener.clone(), info_url.clone()));
                 }
             }
             _ = wake.notified() => {
@@ -205,6 +214,7 @@ async fn hl_listen_with_source(
                     None => return Err("Snapshot task disappeared".into()),
                 }
                 ticker.reset();
+                recovery_retry_at = Instant::now() + Duration::from_secs(10);
             }
             _ = ticker.tick(), if snapshots.is_empty() => {
                 snapshots.spawn(fetch_snapshot(dir.clone(), listener.clone(), info_url.clone()));
@@ -217,16 +227,30 @@ async fn fetch_snapshot(dir: PathBuf, listener: Arc<Mutex<OrderBookListener>>, i
     let started = Instant::now();
     // Capture the validation baseline before asking the node for its snapshot,
     // so updates during export are available to reach that snapshot's height.
-    let (epoch, state, timeout) = {
+    let (epoch, state, timeout, request_started_at_ms) = {
         let mut listener = listener.lock().await;
         let epoch = listener.recovery_epoch;
         listener.begin_caching();
         let cloning = Instant::now();
         let state = listener.clone_state();
         listener.stats.snapshot_clone_ms = cloning.elapsed().as_millis() as u64;
-        (epoch, state, listener.limits.snapshot_timeout)
+        listener.stats.snapshot_requests += 1;
+        let request_started_at_ms = chrono::Utc::now().timestamp_millis();
+        listener.stats.snapshot_request_inflight_started_at_ms = request_started_at_ms;
+        (epoch, state, listener.limits.snapshot_timeout, request_started_at_ms)
     };
-    match process_rmp_file(&dir, &info_url, timeout).await {
+    let request_started = Instant::now();
+    let response = process_rmp_file(&dir, &info_url, timeout).await;
+    let request_ms = request_started.elapsed().as_millis() as u64;
+    let completed_at_ms = chrono::Utc::now().timestamp_millis();
+    {
+        let mut listener = listener.lock().await;
+        listener.stats.snapshot_request_started_at_ms = request_started_at_ms;
+        listener.stats.snapshot_request_ms = request_ms;
+        listener.stats.snapshot_request_completed_at_ms = completed_at_ms;
+        listener.stats.snapshot_request_inflight_started_at_ms = 0;
+    }
+    match response {
         Ok(output_fln) => {
             if listener.lock().await.recovery_epoch != epoch {
                 return Ok(());
@@ -271,6 +295,7 @@ struct ResourceLimits {
     queue_heights: usize,
     queue_age: Duration,
     snapshot_timeout: Duration,
+    snapshot_interval: Duration,
 }
 
 impl ResourceLimits {
@@ -282,6 +307,7 @@ impl ResourceLimits {
         queue_heights: 4096,
         queue_age: Duration::from_secs(120),
         snapshot_timeout: Duration::from_secs(120),
+        snapshot_interval: Duration::from_secs(10),
     };
 
     fn from_env() -> Result<Self> {
@@ -297,6 +323,11 @@ impl ResourceLimits {
             Ok(value)
         }
         let defaults = Self::DEFAULT;
+        let snapshot_interval =
+            number("BOOK_SNAPSHOT_INTERVAL_SECONDS", defaults.snapshot_interval.as_secs() as usize)?;
+        if !(10..=300).contains(&snapshot_interval) {
+            return Err("BOOK_SNAPSHOT_INTERVAL_SECONDS must be between 10 and 300".into());
+        }
         Ok(Self {
             dirty_files: number("BOOK_MAX_DIRTY_FILES", defaults.dirty_files)?,
             turn_bytes: number("BOOK_READ_TURN_BYTES", defaults.turn_bytes)?,
@@ -310,6 +341,7 @@ impl ResourceLimits {
                 "BOOK_SNAPSHOT_TIMEOUT_SECONDS",
                 defaults.snapshot_timeout.as_secs() as usize,
             )? as u64),
+            snapshot_interval: Duration::from_secs(snapshot_interval as u64),
         })
     }
 }
@@ -330,6 +362,11 @@ struct ResourceStats {
     snapshot_clone_ms: u64,
     snapshot_parse_ms: u64,
     snapshot_reconcile_ms: u64,
+    snapshot_requests: u64,
+    snapshot_request_started_at_ms: i64,
+    snapshot_request_completed_at_ms: i64,
+    snapshot_request_ms: u64,
+    snapshot_request_inflight_started_at_ms: i64,
 }
 
 impl ResourceStats {
@@ -348,6 +385,11 @@ impl ResourceStats {
         snapshot_clone_ms: 0,
         snapshot_parse_ms: 0,
         snapshot_reconcile_ms: 0,
+        snapshot_requests: 0,
+        snapshot_request_started_at_ms: 0,
+        snapshot_request_completed_at_ms: 0,
+        snapshot_request_ms: 0,
+        snapshot_request_inflight_started_at_ms: 0,
     };
 }
 
@@ -411,6 +453,7 @@ impl OrderBookListener {
             "snapshot_cache_bytes": self.snapshot_cache_bytes,
             "snapshot_cache_active": self.fetched_snapshot_cache.is_some(),
             "recovery_epoch": self.recovery_epoch,
+            "snapshot_interval_seconds": self.limits.snapshot_interval.as_secs(),
         })
     }
 
@@ -982,10 +1025,17 @@ mod recovery_integration_tests {
             record_bytes: 4096,
             queue_bytes: 2048,
             queue_heights: 8,
+            snapshot_interval: Duration::from_secs(60),
             ..ResourceLimits::DEFAULT
         };
         let task = tokio::spawn(hl_listen_with_source(listener.clone(), dir.clone(), url, limits));
         tokio::time::timeout(Duration::from_secs(10), entered.notified()).await.unwrap();
+        {
+            let state = listener.lock().await;
+            assert!(state.stats.snapshot_request_inflight_started_at_ms > 0);
+            assert_eq!(state.stats.snapshot_request_started_at_ms, 0);
+            assert_eq!(state.stats.snapshot_request_completed_at_ms, 0);
+        }
         let mut records = String::new();
         for number in 101..=164 {
             records += &format!(
@@ -996,7 +1046,7 @@ mod recovery_integration_tests {
             tokio::fs::write(source.event_source_dir(&dir).join("hourly/20260911/0"), &records).await.unwrap();
         }
         height.store(164, AtomicOrdering::SeqCst);
-        // Longer than the regular snapshot interval: still only one owner.
+        // Longer than the recovery retry interval: still only one owner.
         sleep(Duration::from_secs(12)).await;
         assert_eq!(requests.load(AtomicOrdering::SeqCst), 1);
         {
@@ -1018,6 +1068,7 @@ mod recovery_integration_tests {
         .await
         .unwrap();
         assert_eq!(requests.load(AtomicOrdering::SeqCst), 2);
+        // Recovery did not wait for the configured 60-second healthy audit.
         assert_eq!(listener.lock().await.order_book_state.as_ref().unwrap().height(), 164);
         let record = "{\"local_time\":\"2026-09-11T00:00:01\",\"block_time\":\"2026-09-11T00:00:01\",\"block_number\":165,\"events\":[]}\n";
         for source in [EventSource::OrderStatuses, EventSource::OrderDiffs] {
@@ -1040,6 +1091,24 @@ mod recovery_integration_tests {
         .await
         .unwrap();
         assert!(!task.is_finished());
+        sleep(Duration::from_secs(12)).await;
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 2, "healthy audits must respect their interval");
+        height.store(165, AtomicOrdering::SeqCst);
+        listener.lock().await.fence("test recovery during long healthy audit interval");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !listener.lock().await.is_ready() {
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 3);
+        {
+            let state = listener.lock().await;
+            assert_eq!(state.stats.snapshot_request_inflight_started_at_ms, 0);
+            assert!(state.stats.snapshot_request_started_at_ms > 0);
+            assert!(state.stats.snapshot_request_completed_at_ms >= state.stats.snapshot_request_started_at_ms);
+        }
         task.abort();
         let _ = task.await;
         server.abort();
