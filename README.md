@@ -66,3 +66,25 @@ from TT-1506; wire-cache entries cannot survive a source/position change.
 Run `cargo +1.89.0 test --locked --workspace` on Linux (production toolchain).
 The existing directory-notification integration test can duplicate file events on
 macOS; the Linux CI runs it along with source recovery and transport tests.
+
+## Snapshot audit cadence (TT-1708)
+
+`BOOK_SNAPSHOT_INTERVAL_SECONDS` controls the delay after a completed routine
+snapshot audit (10–300 seconds, default 10). `/resources` exposes the configured
+interval, snapshot request count, latest request start/completion timestamps and
+HTTP request duration. Duration includes node snapshot generation and excludes
+local snapshot parsing/reconciliation.
+
+Startup still requests its first snapshot after five seconds. A fenced listener
+uses the one-second maintenance loop and a ten-second retry delay after its last
+completed request, independently of the healthy audit interval. There is still
+only one snapshot owner, including while a timed-out or invalidated request is
+finishing. Queue bounds, consistency checks and source freshness are unchanged.
+
+The proposed production trial is 60 seconds, compared with the current 10-second
+setting. A longer healthy interval reduces repeated full L4 exports and local
+cloning/reconciliation, but also increases the interval between independent
+full-state consistency checks. Continuous source ordering/gap checks remain
+active. This is a targeted contention mitigation to measure, not a claim that it
+eliminates Hyperliquid's own periodic ABCI checkpoint pauses. Do not raise the
+three-second freshness limit to make the comparison pass.
