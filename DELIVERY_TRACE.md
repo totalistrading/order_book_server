@@ -28,3 +28,10 @@ Prompt completion combined with late gateway parsing leaves proxy/transport or
 client buffering to resolve with matched transport observations. Source export
 must be checked separately: September 24's 15:16 incident already had raw export
 age above the three-second freshness fence, unlike the 13:11 and 13:38 incidents.
+
+Trade and L4 dispatch is scoped to active subscription types: a connection with
+no subscriber to that type does not convert or freshness-check that broadcast.
+Subscribed streams retain their three-second checks. Trade/L4 source-age errors
+include stream type, height and source time, without payloads. A completed final
+L2 batch does not identify which other message type later failed; use the typed
+error rather than attributing every disconnect to L2 delivery.

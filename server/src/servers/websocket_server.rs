@@ -175,20 +175,10 @@ async fn handle_socket(
                                 delivery_trace.complete();
                             },
                             InternalMessage::Fills{ batch } => {
-                                require_recent_source(batch.block_time())?;
-                                let mut trades = coin_to_trades(batch);
-                                for sub in manager.subscriptions() {
-                                    require_recent_source(batch.block_time())?;
-                                    send_ws_data_from_trades(&mut socket, sub, &mut trades).await?;
-                                }
+                                send_fill_batch(&mut socket, manager.subscriptions(), batch).await?;
                             },
                             InternalMessage::L4BookUpdates{ diff_batch, status_batch } => {
-                                require_recent_source(diff_batch.block_time())?;
-                                let mut book_updates = coin_to_book_updates(diff_batch, status_batch);
-                                for sub in manager.subscriptions() {
-                                    require_recent_source(diff_batch.block_time())?;
-                                    send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await?;
-                                }
+                                send_l4_batch(&mut socket, manager.subscriptions(), diff_batch, status_batch).await?;
                             },
                         }
 
@@ -462,6 +452,69 @@ async fn send_ws_data_from_snapshot(
     Ok(false)
 }
 
+async fn send_fill_batch<S>(
+    socket: &mut S,
+    subscriptions: &HashSet<Subscription>,
+    batch: &Batch<NodeDataFill>,
+) -> Result<()>
+where
+    S: Sink<FrameView> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    // Unsubscribed streams must not fence this connection or incur conversion work.
+    if !subscriptions.iter().any(|sub| matches!(sub, Subscription::Trades { .. })) {
+        return Ok(());
+    }
+    require_recent_source(batch.block_time()).map_err(|error| {
+        format!("{error}; stream=trades height={} source_time_ms={}", batch.block_number(), batch.block_time())
+    })?;
+    let mut trades = coin_to_trades(batch);
+    for sub in subscriptions {
+        if !matches!(sub, Subscription::Trades { .. }) {
+            continue;
+        }
+        require_recent_source(batch.block_time()).map_err(|error| {
+            format!("{error}; stream=trades height={} source_time_ms={}", batch.block_number(), batch.block_time())
+        })?;
+        send_ws_data_from_trades(socket, sub, &mut trades).await?;
+    }
+    Ok(())
+}
+
+async fn send_l4_batch<S>(
+    socket: &mut S,
+    subscriptions: &HashSet<Subscription>,
+    diff_batch: &Batch<NodeDataOrderDiff>,
+    status_batch: &Batch<NodeDataOrderStatus>,
+) -> Result<()>
+where
+    S: Sink<FrameView> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    // Unsubscribed streams must not fence this connection or incur conversion work.
+    if !subscriptions.iter().any(|sub| matches!(sub, Subscription::L4Book { .. })) {
+        return Ok(());
+    }
+    require_recent_source(diff_batch.block_time()).map_err(|error| {
+        format!("{error}; stream=l4 height={} source_time_ms={}", diff_batch.block_number(), diff_batch.block_time())
+    })?;
+    let mut book_updates = coin_to_book_updates(diff_batch, status_batch);
+    for sub in subscriptions {
+        if !matches!(sub, Subscription::L4Book { .. }) {
+            continue;
+        }
+        require_recent_source(diff_batch.block_time()).map_err(|error| {
+            format!(
+                "{error}; stream=l4 height={} source_time_ms={}",
+                diff_batch.block_number(),
+                diff_batch.block_time()
+            )
+        })?;
+        send_ws_data_from_book_updates(socket, sub, &mut book_updates).await?;
+    }
+    Ok(())
+}
+
 fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
     let mut fills = batch.clone().events();
     let mut trades = HashMap::new();
@@ -506,11 +559,15 @@ fn coin_to_book_updates(
     updates
 }
 
-async fn send_ws_data_from_book_updates(
-    socket: &mut WebSocket,
+async fn send_ws_data_from_book_updates<S>(
+    socket: &mut S,
     subscription: &Subscription,
     book_updates: &mut HashMap<String, L4BookUpdates>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: Sink<FrameView> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     if let Subscription::L4Book { coin } = subscription {
         if let Some(updates) = book_updates.remove(coin) {
             let msg = ServerResponse::L4Book(L4Book::Updates(updates));
@@ -520,11 +577,15 @@ async fn send_ws_data_from_book_updates(
     Ok(())
 }
 
-async fn send_ws_data_from_trades(
-    socket: &mut WebSocket,
+async fn send_ws_data_from_trades<S>(
+    socket: &mut S,
     subscription: &Subscription,
     trades: &mut HashMap<String, Vec<Trade>>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: Sink<FrameView> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
     if let Subscription::Trades { coin } = subscription {
         if let Some(trades) = trades.remove(coin) {
             let msg = ServerResponse::Trades(trades);
@@ -667,6 +728,51 @@ mod transport_tests {
         fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             self.poll_flush(cx)
         }
+    }
+
+    fn stale_empty_batch<T: serde::de::DeserializeOwned>() -> Batch<T> {
+        let stale = (chrono::Utc::now() - chrono::Duration::seconds(10)).naive_utc();
+        serde_json::from_value(serde_json::json!({
+            "local_time":stale, "block_time":stale,
+            "block_number":1, "events":[]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unrelated_stale_streams_do_not_disconnect_l2_only_subscriber() {
+        let subscriptions = HashSet::from([Subscription::L2Book {
+            coin: "BTC".into(),
+            n_sig_figs: None,
+            n_levels: None,
+            mantissa: None,
+        }]);
+        let mut socket = TestSocket::default();
+        assert!(send_fill_batch(&mut socket, &subscriptions, &stale_empty_batch()).await.is_ok());
+        assert!(send_l4_batch(&mut socket, &subscriptions, &stale_empty_batch(), &stale_empty_batch()).await.is_ok());
+        assert_eq!(socket.sent, 0);
+    }
+
+    #[tokio::test]
+    async fn gateway_book_and_trade_subscription_ignores_stale_l4() {
+        let subscriptions = HashSet::from([
+            Subscription::L2Book { coin: "BTC".into(), n_sig_figs: None, n_levels: None, mantissa: None },
+            Subscription::Trades { coin: "BTC".into() },
+        ]);
+        let mut socket = TestSocket::default();
+        assert!(send_l4_batch(&mut socket, &subscriptions, &stale_empty_batch(), &stale_empty_batch()).await.is_ok());
+        assert!(send_fill_batch(&mut socket, &subscriptions, &stale_empty_batch()).await.is_err());
+        assert_eq!(socket.sent, 0);
+    }
+
+    #[tokio::test]
+    async fn subscribed_stale_streams_still_fail_before_sending() {
+        let mut socket = TestSocket::default();
+        let subscriptions = HashSet::from([Subscription::Trades { coin: "BTC".into() }]);
+        assert!(send_fill_batch(&mut socket, &subscriptions, &stale_empty_batch()).await.is_err());
+        let subscriptions = HashSet::from([Subscription::L4Book { coin: "BTC".into() }]);
+        assert!(send_l4_batch(&mut socket, &subscriptions, &stale_empty_batch(), &stale_empty_batch()).await.is_err());
+        assert_eq!(socket.sent, 0);
     }
 
     #[tokio::test]
