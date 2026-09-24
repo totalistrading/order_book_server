@@ -731,8 +731,9 @@ mod transport_tests {
     }
 
     fn stale_empty_batch<T: serde::de::DeserializeOwned>() -> Batch<T> {
+        let stale = (chrono::Utc::now() - chrono::Duration::seconds(10)).naive_utc();
         serde_json::from_value(serde_json::json!({
-            "local_time":"2026-01-01T00:00:00", "block_time":"2026-01-01T00:00:00",
+            "local_time":stale, "block_time":stale,
             "block_number":1, "events":[]
         }))
         .unwrap()
