@@ -1,3 +1,4 @@
+use super::delivery_trace::DeliveryTrace;
 use crate::{
     listeners::order_book::{
         InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots, hl_listen,
@@ -107,6 +108,11 @@ fn ws_handler(
         return (axum::http::StatusCode::TOO_MANY_REQUESTS, "Connection capacity reached").into_response();
     };
     let (resp, fut) = incoming.upgrade(websocket_opts).unwrap();
+    let mut resp = resp.into_response();
+    let trace = DeliveryTrace::new();
+    if let Ok(id) = axum::http::HeaderValue::from_str(&trace.id) {
+        resp.headers_mut().insert("x-source-connection-id", id);
+    }
     tokio::spawn(async move {
         let _permit = permit;
         let ws = match tokio::time::timeout(std::time::Duration::from_secs(5), fut).await {
@@ -121,7 +127,7 @@ fn ws_handler(
             }
         };
 
-        if let Err(err) = handle_socket(ws, internal_message_tx, listener, ignore_spot, wire_cache).await {
+        if let Err(err) = handle_socket(ws, internal_message_tx, listener, ignore_spot, wire_cache, trace).await {
             error!("Book stream connection terminated: {err}");
         }
     });
@@ -135,6 +141,7 @@ async fn handle_socket(
     listener: Arc<Mutex<OrderBookListener>>,
     ignore_spot: bool,
     wire_cache: Arc<std::sync::Mutex<BookWireCache>>,
+    mut delivery_trace: DeliveryTrace,
 ) -> Result<()> {
     let mut internal_message_rx = internal_message_tx.subscribe();
     let is_ready = listener.lock().await.is_ready();
@@ -158,10 +165,14 @@ async fn handle_socket(
                                 return Ok(());
                             }
                             InternalMessage::Snapshot{ l2_snapshots, time, height } => {
+                                delivery_trace.begin(*height, *time);
                                 universe = new_universe(l2_snapshots, ignore_spot);
                                 for sub in manager.subscriptions() {
-                                    send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots, *time, *height, &mut sent_positions, &wire_cache).await?;
+                                    if send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots, *time, *height, &mut sent_positions, &wire_cache).await? {
+                                        delivery_trace.sent();
+                                    }
                                 }
+                                delivery_trace.complete();
                             },
                             InternalMessage::Fills{ batch } => {
                                 require_recent_source(batch.block_time())?;
@@ -428,14 +439,14 @@ async fn send_ws_data_from_snapshot(
     height: u64,
     sent_positions: &mut HashMap<String, u64>,
     cache: &std::sync::Mutex<BookWireCache>,
-) -> Result<()> {
+) -> Result<bool> {
     if !matches!(subscription, Subscription::L2Book { .. }) {
-        return Ok(());
+        return Ok(false);
     }
     require_recent_source(time)?;
     let key = serde_json::to_string(subscription)?;
     if sent_positions.get(&key).is_some_and(|previous| height <= *previous) {
-        return Ok(());
+        return Ok(false);
     }
     let encoded = {
         let mut cache = cache.lock().map_err(|_| "Book wire cache poisoned")?;
@@ -446,8 +457,9 @@ async fn send_ws_data_from_snapshot(
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Book stream write timeout"))??;
         sent_positions.insert(key, height);
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
