@@ -26,15 +26,17 @@ pub(super) struct BatchTrace {
 #[derive(Serialize)]
 pub(super) struct DeliveryTrace {
     pub id: String,
+    source_peer_port: u16,
     opened_at_ms: u64,
     closed_at_ms: Option<u64>,
     batches: VecDeque<BatchTrace>,
 }
 
 impl DeliveryTrace {
-    pub fn new() -> Self {
+    pub fn new(source_peer_port: u16) -> Self {
         Self {
             id: format!("{:x}-{:x}-{:x}", now_ms(), std::process::id(), NEXT_ID.fetch_add(1, Ordering::Relaxed)),
+            source_peer_port,
             opened_at_ms: now_ms(),
             closed_at_ms: None,
             batches: VecDeque::with_capacity(HISTORY),
@@ -80,14 +82,17 @@ mod tests {
     use super::*;
     #[test]
     fn identity_is_connection_local_and_header_safe() {
-        let a = DeliveryTrace::new();
-        let b = DeliveryTrace::new();
+        let a = DeliveryTrace::new(43210);
+        let b = DeliveryTrace::new(43210);
         assert_ne!(a.id, b.id);
+        let value = serde_json::to_value(&a).unwrap();
+        assert_eq!(value["source_peer_port"], 43210);
+        assert!(value.get("peer_address").is_none());
         assert!(a.id.bytes().all(|c| c.is_ascii_hexdigit() || c == b'-'));
     }
     #[test]
     fn history_is_bounded_and_incomplete_batch_is_not_acknowledged() {
-        let mut trace = DeliveryTrace::new();
+        let mut trace = DeliveryTrace::new(43210);
         for height in 0..200 {
             trace.begin(height, height * 100);
             trace.complete();

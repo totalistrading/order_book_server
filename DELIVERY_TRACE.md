@@ -35,3 +35,13 @@ Subscribed streams retain their three-second checks. Trade/L4 source-age errors
 include stream type, height and source time, without payloads. A completed final
 L2 batch does not identify which other message type later failed; use the typed
 error rather than attributing every disconnect to L2 delivery.
+
+The trace's `source_peer_port` is the numeric TCP peer port provided by Axum's
+accepted connection metadata, never a request header. It identifies the
+proxy-to-book hop (book listener port 8000); the gateway's separate
+`edge_peer_port` identifies the gateway-to-proxy hop (edge listener port 8443).
+Match each only within the trace's observed connection lifetime and reject
+ambiguous port reuse. No peer address is retained. Existing source socket
+captures already collect both hops, so a uniquely matched trace can distinguish
+book-to-proxy queuing from proxy-to-gateway queuing. ACKs still acknowledge TCP
+bytes, not application consumption.
