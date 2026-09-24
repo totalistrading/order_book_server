@@ -14,12 +14,13 @@ use crate::{
         },
     },
 };
-use axum::{Router, response::IntoResponse, routing::get};
+use axum::{Router, extract::ConnectInfo, response::IntoResponse, routing::get};
 use futures_util::{Sink, SinkExt, StreamExt};
 use log::{error, info};
 use std::{
     collections::{HashMap, HashSet},
     env::home_dir,
+    net::SocketAddr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -70,9 +71,10 @@ pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_
             "/ws",
             get({
                 let internal_message_tx = internal_message_tx.clone();
-                async move |ws_upgrade| {
+                async move |ConnectInfo(peer): ConnectInfo<SocketAddr>, ws_upgrade| {
                     ws_handler(
                         ws_upgrade,
+                        peer.port(),
                         internal_message_tx.clone(),
                         listener.clone(),
                         ignore_spot,
@@ -87,7 +89,7 @@ pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_
     let listener = TcpListener::bind(address).await?;
     info!("WebSocket server running at ws://{address}");
 
-    if let Err(err) = axum::serve(listener, app.into_make_service()).await {
+    if let Err(err) = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await {
         error!("Server fatal error: {err}");
         std::process::exit(2);
     }
@@ -97,6 +99,7 @@ pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_
 
 fn ws_handler(
     incoming: yawc::IncomingUpgrade,
+    source_peer_port: u16,
     internal_message_tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
     ignore_spot: bool,
@@ -109,7 +112,7 @@ fn ws_handler(
     };
     let (resp, fut) = incoming.upgrade(websocket_opts).unwrap();
     let mut resp = resp.into_response();
-    let trace = DeliveryTrace::new();
+    let trace = DeliveryTrace::new(source_peer_port);
     if let Ok(id) = axum::http::HeaderValue::from_str(&trace.id) {
         resp.headers_mut().insert("x-source-connection-id", id);
     }
