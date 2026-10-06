@@ -1114,7 +1114,12 @@ mod tests {
             ));
         }
         println!("snapshot {} MiB, open-block statuses {} KiB", snapshot.len() >> 20, blocks[0].0.len() >> 10);
+        // BENCH_SCOPE=all|hip4 runs one scope per process, for peak-RSS comparison.
+        let only = std::env::var("BENCH_SCOPE").ok();
         for scope in [CoinScope::all(), CoinScope::default()] {
+            if only.as_ref().is_some_and(|only| *only != scope.describe()) {
+                continue;
+            }
             let baseline = rss_mib();
             let (tx, _rx) = tokio::sync::broadcast::channel(1024);
             let mut listener = OrderBookListener::new(Some(tx), true, scope.clone());
