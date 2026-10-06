@@ -1089,8 +1089,9 @@ mod tests {
         let snapshot = serde_json::json!([100, books]).to_string();
         let open = |order: serde_json::Value| serde_json::json!({"time":"2026-09-11T00:00:01", "user":Address::ZERO, "status":"open", "order":order});
         // Alternate blocks: 5,000 resting orders open, then are removed (1% HIP-4).
-        let coin_of =
-            |index: u64| if index % 100 == 0 { format!("#{}0", index % 200) } else { format!("C{}0", index % 400) };
+        let coin_of = |index: u64| {
+            if index % 100 == 0 { format!("#{}0", (index / 100) % 200) } else { format!("C{}0", index % 400) }
+        };
         let mut blocks = Vec::new();
         for height in 101..=140_u64 {
             let (statuses, diffs): (Vec<_>, Vec<_>) = (0..5000_u64)
