@@ -1,7 +1,10 @@
-use crate::types::{L2Book, L4Book, Trade};
+use crate::{
+    prelude::*,
+    types::{L2Book, L4Book, Trade},
+};
 use log::info;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 const MAX_LEVELS: usize = 100;
 pub(crate) const MAX_SUBSCRIPTIONS: usize = 2048;
@@ -9,6 +12,64 @@ pub(crate) const DEFAULT_LEVELS: usize = 20;
 
 pub(crate) fn is_hip4_coin(coin: &str) -> bool {
     coin.strip_prefix('#').is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Coins whose books, trades and L4 updates are materialised. HIP-4 outcome
+/// coins are always in scope; everything else is dropped at parse time unless
+/// `BOOK_EXTRA_COINS` lists it (comma separated) or is `*` (every market).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CoinScope {
+    all: bool,
+    extra: Arc<HashSet<String>>,
+}
+
+impl CoinScope {
+    pub(crate) fn all() -> Self {
+        Self { all: true, extra: Arc::default() }
+    }
+
+    pub(crate) fn from_env() -> Result<Self> {
+        match std::env::var("BOOK_EXTRA_COINS") {
+            Ok(value) => Self::parse(&value).map_err(|err| format!("BOOK_EXTRA_COINS: {err}").into()),
+            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
+            Err(err) => Err(format!("BOOK_EXTRA_COINS: {err}").into()),
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Ok(Self::default());
+        }
+        if value == "*" {
+            return Ok(Self::all());
+        }
+        let mut extra = HashSet::new();
+        for coin in value.split(',').map(str::trim) {
+            if coin.is_empty() || coin.len() > 64 || coin == "*" {
+                return Err(format!("invalid coin {coin:?}; use a comma-separated list or a lone *").into());
+            }
+            extra.insert(coin.to_string());
+        }
+        Ok(Self { all: false, extra: Arc::new(extra) })
+    }
+
+    pub(crate) const fn is_all(&self) -> bool {
+        self.all
+    }
+
+    pub(crate) fn contains(&self, coin: &str) -> bool {
+        self.all || is_hip4_coin(coin) || self.extra.contains(coin)
+    }
+
+    pub(crate) fn describe(&self) -> String {
+        if self.all {
+            return "all".into();
+        }
+        let mut extra: Vec<_> = self.extra.iter().map(String::as_str).collect();
+        extra.sort_unstable();
+        std::iter::once("hip4").chain(extra).collect::<Vec<_>>().join(",")
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -121,7 +182,7 @@ impl SubscriptionManager {
 mod test {
     use std::collections::HashSet;
 
-    use crate::types::subscription::{Subscription, is_hip4_coin};
+    use crate::types::subscription::{CoinScope, Subscription, is_hip4_coin};
 
     use super::{ClientMessage, ServerResponse};
 
@@ -199,5 +260,22 @@ mod test {
             Subscription::L2Book { coin: "#154170".to_string(), n_sig_figs: None, n_levels: Some(100), mantissa: None }
                 .validate(&universe)
         );
+    }
+
+    #[test]
+    fn coin_scope_defaults_to_hip4_and_accepts_an_explicit_allowlist() {
+        let hip4 = CoinScope::parse("").unwrap();
+        assert!(hip4.contains("#154170"));
+        assert!(!hip4.contains("BTC") && !hip4.contains("@107") && !hip4.contains("#BTC"));
+        assert_eq!(hip4.describe(), "hip4");
+        let extra = CoinScope::parse(" BTC, @107 ").unwrap();
+        assert!(extra.contains("#10") && extra.contains("BTC") && extra.contains("@107"));
+        assert!(!extra.contains("ETH"));
+        assert_eq!(extra.describe(), "hip4,@107,BTC");
+        let all = CoinScope::parse("*").unwrap();
+        assert!(all.is_all() && all.contains("ETH") && all.contains("PURR/USDC"));
+        for invalid in ["BTC,", ",", "BTC,*", &"X".repeat(65)] {
+            assert!(CoinScope::parse(invalid).is_err(), "{invalid}");
+        }
     }
 }

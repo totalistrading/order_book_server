@@ -9,6 +9,7 @@ use crate::{
         L4Order,
         inner::{InnerL4Order, InnerLevel},
         node_data::{Batch, EventSource, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
+        subscription::CoinScope,
     },
 };
 use alloy::primitives::Address;
@@ -227,7 +228,7 @@ async fn fetch_snapshot(dir: PathBuf, listener: Arc<Mutex<OrderBookListener>>, i
     let started = Instant::now();
     // Capture the validation baseline before asking the node for its snapshot,
     // so updates during export are available to reach that snapshot's height.
-    let (epoch, state, timeout, request_started_at_ms) = {
+    let (epoch, state, timeout, request_started_at_ms, scope) = {
         let mut listener = listener.lock().await;
         let epoch = listener.recovery_epoch;
         listener.begin_caching();
@@ -237,7 +238,7 @@ async fn fetch_snapshot(dir: PathBuf, listener: Arc<Mutex<OrderBookListener>>, i
         listener.stats.snapshot_requests += 1;
         let request_started_at_ms = chrono::Utc::now().timestamp_millis();
         listener.stats.snapshot_request_inflight_started_at_ms = request_started_at_ms;
-        (epoch, state, listener.limits.snapshot_timeout, request_started_at_ms)
+        (epoch, state, listener.limits.snapshot_timeout, request_started_at_ms, listener.scope.clone())
     };
     let request_started = Instant::now();
     let response = process_rmp_file(&dir, &info_url, timeout).await;
@@ -256,7 +257,8 @@ async fn fetch_snapshot(dir: PathBuf, listener: Arc<Mutex<OrderBookListener>>, i
                 return Ok(());
             }
             let parsing = Instant::now();
-            let snapshot = load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(output_fln.path()).await;
+            let snapshot =
+                load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(output_fln.path(), &scope).await;
             listener.lock().await.stats.snapshot_parse_ms = parsing.elapsed().as_millis() as u64;
             info!("Snapshot fetched");
             // sleep to let some updates build up.
@@ -400,6 +402,9 @@ pub(crate) struct OrderBookListener {
     snapshot_cache_bytes: usize,
     snapshot_cache_started: Option<Instant>,
     ignore_spot: bool,
+    // Both the live state and every validation snapshot are restricted to this
+    // scope at parse time, so consistency checks compare like with like.
+    scope: CoinScope,
     // None if we haven't seen a valid snapshot yet
     order_book_state: Option<OrderBookState>,
     last_fill: Option<u64>,
@@ -411,7 +416,11 @@ pub(crate) struct OrderBookListener {
 }
 
 impl OrderBookListener {
-    pub(crate) const fn new(internal_message_tx: Option<Sender<Arc<InternalMessage>>>, ignore_spot: bool) -> Self {
+    pub(crate) const fn new(
+        internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
+        ignore_spot: bool,
+        scope: CoinScope,
+    ) -> Self {
         Self {
             stats: ResourceStats::EMPTY,
             limits: ResourceLimits::DEFAULT,
@@ -419,6 +428,7 @@ impl OrderBookListener {
             snapshot_cache_bytes: 0,
             snapshot_cache_started: None,
             ignore_spot,
+            scope,
             order_book_state: None,
             last_fill: None,
             fetched_snapshot_cache: None,
@@ -447,6 +457,8 @@ impl OrderBookListener {
         serde_json::json!({
             "ready": self.is_ready(),
             "source_height": self.order_book_state.as_ref().map(OrderBookState::height),
+            "coin_scope": self.scope.describe(),
+            "book_count": self.order_book_state.as_ref().map(OrderBookState::book_count),
             "stats": self.stats,
             "unmatched_status_bytes": self.order_status_cache.bytes(),
             "unmatched_diff_bytes": self.order_diff_cache.bytes(),
@@ -692,16 +704,12 @@ impl OrderBookListener {
                 continue;
             }
             let res = match event_source {
-                EventSource::Fills => serde_json::from_str::<Batch<NodeDataFill>>(line).map(|batch| {
-                    let height = batch.block_number();
-                    (height, EventBatch::Fills(batch.with_wire_bytes(line.len())))
-                }),
-                EventSource::OrderStatuses => serde_json::from_str(line).map(|batch: Batch<NodeDataOrderStatus>| {
-                    (batch.block_number(), EventBatch::Orders(batch.with_wire_bytes(line.len())))
-                }),
-                EventSource::OrderDiffs => serde_json::from_str(line).map(|batch: Batch<NodeDataOrderDiff>| {
-                    (batch.block_number(), EventBatch::BookDiffs(batch.with_wire_bytes(line.len())))
-                }),
+                EventSource::Fills => Batch::<NodeDataFill>::parse_in_scope(line, &self.scope)
+                    .map(|batch| (batch.block_number(), EventBatch::Fills(batch))),
+                EventSource::OrderStatuses => Batch::<NodeDataOrderStatus>::parse_in_scope(line, &self.scope)
+                    .map(|batch| (batch.block_number(), EventBatch::Orders(batch))),
+                EventSource::OrderDiffs => Batch::<NodeDataOrderDiff>::parse_in_scope(line, &self.scope)
+                    .map(|batch| (batch.block_number(), EventBatch::BookDiffs(batch))),
             };
             let (height, event_batch) = match res {
                 Ok(data) => data,
@@ -773,16 +781,18 @@ pub(crate) struct L2SnapshotParams {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::order_book::multi_book::load_snapshots_from_str;
+    use crate::{order_book::multi_book::load_snapshots_from_str, types::subscription::Subscription};
 
     #[test]
     fn adds_empty_market_without_resetting_existing_consumers() -> Result<()> {
         let (tx, mut rx) = tokio::sync::broadcast::channel(16);
-        let mut listener = OrderBookListener::new(Some(tx), false);
+        let mut listener = OrderBookListener::new(Some(tx), false, CoinScope::all());
         listener.order_book_state =
             Some(OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 100, 1234, true, false));
-        let (_, expected) =
-            load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(r#"[100, [["NEW", [[], []]]]]"#)?;
+        let (_, expected) = load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(
+            r#"[100, [["NEW", [[], []]]]]"#,
+            &CoinScope::all(),
+        )?;
 
         listener.reconcile_snapshot(listener.clone_state(), expected, 100, VecDeque::new())?;
 
@@ -803,7 +813,7 @@ mod tests {
     #[test]
     fn empty_addition_replays_updates_before_preserving_consumers() -> Result<()> {
         let (tx, mut rx) = tokio::sync::broadcast::channel(16);
-        let mut listener = OrderBookListener::new(Some(tx), false);
+        let mut listener = OrderBookListener::new(Some(tx), false, CoinScope::all());
         let baseline = OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 100, 1234, true, false);
         let record =
             r#"{"local_time":"2026-09-11T00:00:01","block_time":"2026-09-11T00:00:01","block_number":101,"events":[]}"#;
@@ -813,8 +823,10 @@ mod tests {
         live.apply_updates(statuses.clone(), diffs.clone())?;
         let expected_time = live.compute_snapshot().time;
         listener.order_book_state = Some(live);
-        let (_, expected) =
-            load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(r#"[100, [["NEW", [[], []]]]]"#)?;
+        let (_, expected) = load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(
+            r#"[100, [["NEW", [[], []]]]]"#,
+            &CoinScope::all(),
+        )?;
         listener.reconcile_snapshot(Some(baseline), expected, 100, VecDeque::from([(statuses, diffs)]))?;
         let result = listener.compute_snapshot().unwrap();
         assert_eq!((result.height, result.time), (101, expected_time));
@@ -832,7 +844,7 @@ mod tests {
 
     #[test]
     fn ignores_snapshot_older_than_live_state() -> Result<()> {
-        let mut listener = OrderBookListener::new(None, false);
+        let mut listener = OrderBookListener::new(None, false, CoinScope::all());
         listener.order_book_state =
             Some(OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 101, 0, true, false));
 
@@ -844,14 +856,14 @@ mod tests {
 
     #[test]
     fn malformed_and_incomplete_records_require_recovery() {
-        let mut listener = OrderBookListener::new(None, false);
+        let mut listener = OrderBookListener::new(None, false, CoinScope::all());
         assert!(listener.process_data("not-json\n".into(), EventSource::OrderStatuses).is_err());
         assert!(listener.process_data("unfinished".into(), EventSource::OrderStatuses).is_err());
     }
 
     #[test]
     fn snapshot_ahead_of_cache_is_retried_later() -> Result<()> {
-        let mut listener = OrderBookListener::new(None, false);
+        let mut listener = OrderBookListener::new(None, false, CoinScope::all());
         listener.order_book_state =
             Some(OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 100, 0, true, false));
 
@@ -871,7 +883,7 @@ mod tests {
 
     #[test]
     fn old_snapshot_cannot_reopen_a_fenced_stream() {
-        let mut listener = OrderBookListener::new(None, false);
+        let mut listener = OrderBookListener::new(None, false, CoinScope::all());
         let old_epoch = listener.recovery_epoch;
         listener.fence("test missing block");
         listener.finish_snapshot(old_epoch, None, Snapshots::new(HashMap::new()), 100).unwrap();
@@ -882,7 +894,7 @@ mod tests {
 
     #[test]
     fn validation_cache_overflow_drops_only_validation_and_preserves_live_progress() {
-        let mut listener = OrderBookListener::new(None, false);
+        let mut listener = OrderBookListener::new(None, false, CoinScope::all());
         listener.limits.queue_bytes = 30;
         listener.order_book_state =
             Some(OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 100, 0, true, false));
@@ -901,10 +913,261 @@ mod tests {
         assert_eq!(listener.order_book_state.as_ref().unwrap().height(), 102);
     }
 
+    fn scoped_order(coin: &str, oid: u64, side: &str, px: &str, sz: &str) -> serde_json::Value {
+        serde_json::json!({
+            "coin": coin, "side": side, "limitPx": px, "sz": sz, "oid": oid, "timestamp": 1000,
+            "triggerCondition": "N/A", "isTrigger": false, "triggerPx": "0.0", "isPositionTpsl": false,
+            "reduceOnly": false, "orderType": "Limit", "tif": "Gtc", "cloid": null
+        })
+    }
+
+    fn scoped_book(coin: &str, bids: &[serde_json::Value], asks: &[serde_json::Value]) -> serde_json::Value {
+        let side = |orders: &[serde_json::Value]| {
+            orders.iter().map(|order| serde_json::json!([Address::ZERO, order])).collect::<Vec<_>>()
+        };
+        serde_json::json!([coin, [side(bids), side(asks)]])
+    }
+
+    fn scoped_block(height: u64, events: serde_json::Value) -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "local_time":"2026-09-11T00:00:01", "block_time":"2026-09-11T00:00:01",
+                "block_number":height, "events":events
+            })
+        )
+    }
+
+    /// Node snapshot at 100, one mixed block at 101, and the node snapshot at 101.
+    fn mixed_market_fixture() -> (String, String, String, String) {
+        let before = serde_json::json!([
+            100,
+            [
+                scoped_book("BTC", &[scoped_order("BTC", 1, "B", "100.0", "1.0")], &[]),
+                scoped_book("#10", &[scoped_order("#10", 2, "B", "0.5", "10.0")], &[]),
+                scoped_book("@1", &[], &[scoped_order("@1", 3, "A", "30.0", "2.0")]),
+            ]
+        ]);
+        let open = |order: serde_json::Value| serde_json::json!({"time":"2026-09-11T00:00:01", "user":Address::ZERO, "status":"open", "order":order});
+        let statuses = scoped_block(
+            101,
+            serde_json::json!([
+                open(scoped_order("BTC", 4, "A", "101.0", "2.0")),
+                open(scoped_order("#10", 5, "A", "0.6", "3.0")),
+            ]),
+        );
+        let diff = |coin: &str, oid: u64, px: &str, diff: serde_json::Value| serde_json::json!({"user":Address::ZERO, "oid":oid, "px":px, "coin":coin, "raw_book_diff":diff});
+        let diffs = scoped_block(
+            101,
+            serde_json::json!([
+                diff("BTC", 4, "101.0", serde_json::json!({"new":{"sz":"2.0"}})),
+                diff("#10", 5, "0.6", serde_json::json!({"new":{"sz":"3.0"}})),
+                diff("BTC", 1, "100.0", serde_json::json!("remove")),
+                diff("#10", 2, "0.5", serde_json::json!({"update":{"origSz":"10.0","newSz":"7.0"}})),
+            ]),
+        );
+        let after = serde_json::json!([
+            101,
+            [
+                scoped_book("BTC", &[], &[scoped_order("BTC", 4, "A", "101.0", "2.0")]),
+                scoped_book(
+                    "#10",
+                    &[scoped_order("#10", 2, "B", "0.5", "7.0")],
+                    &[scoped_order("#10", 5, "A", "0.6", "3.0")]
+                ),
+                scoped_book("@1", &[], &[scoped_order("@1", 3, "A", "30.0", "2.0")]),
+            ]
+        ]);
+        (before.to_string(), statuses, diffs, after.to_string())
+    }
+
+    fn mixed_market_listener(scope: &CoinScope) -> Result<OrderBookListener> {
+        let (before, statuses, diffs, _) = mixed_market_fixture();
+        // Production runs with ignore_spot = true.
+        let mut listener = OrderBookListener::new(None, true, scope.clone());
+        let (height, snapshot) = load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&before, scope)?;
+        listener.finish_snapshot(listener.recovery_epoch, None, snapshot, height)?;
+        listener.process_data(statuses, EventSource::OrderStatuses)?;
+        listener.process_data(diffs, EventSource::OrderDiffs)?;
+        assert_eq!(listener.order_book_state.as_ref().unwrap().height(), 101);
+        Ok(listener)
+    }
+
+    #[test]
+    fn hip4_scope_skips_other_markets_and_keeps_hip4_books_identical() -> Result<()> {
+        let mut full = mixed_market_listener(&CoinScope::all())?;
+        let mut hip4 = mixed_market_listener(&CoinScope::default())?;
+        assert!(full.universe().contains(&Coin::new("BTC")));
+        assert_eq!(hip4.universe(), HashSet::from([Coin::new("#10")]));
+        assert_eq!(hip4.order_book_state.as_ref().unwrap().book_count(), 1);
+
+        let (full_time, full_height, full_l2) = full.compute_l2_snapshot().unwrap();
+        let (hip4_time, hip4_height, hip4_l2) = hip4.compute_l2_snapshot().unwrap();
+        assert_eq!((hip4_time, hip4_height), (full_time, full_height));
+        assert_eq!(hip4_l2.as_ref().len(), 1);
+        let coin = Coin::new("#10");
+        let views = &hip4_l2.as_ref()[&coin];
+        assert_eq!(views.len(), full_l2.as_ref()[&coin].len());
+        for (params, view) in views.as_ref() {
+            assert_eq!(
+                view.clone().export_inner_snapshot(),
+                full_l2.as_ref()[&coin][params].clone().export_inner_snapshot()
+            );
+        }
+        let full_l4 = full.compute_snapshot().unwrap().snapshot;
+        let hip4_l4 = hip4.compute_snapshot().unwrap().snapshot;
+        assert_eq!(hip4_l4.as_ref()[&coin].as_ref(), full_l4.as_ref()[&coin].as_ref());
+
+        let universe: HashSet<String> = hip4.universe().into_iter().map(|coin| coin.value()).collect();
+        let l2 =
+            |coin: &str| Subscription::L2Book { coin: coin.into(), n_sig_figs: None, n_levels: None, mantissa: None };
+        assert!(l2("#10").validate(&universe));
+        assert!(!l2("BTC").validate(&universe));
+        assert!(!Subscription::Trades { coin: "BTC".into() }.validate(&universe));
+        assert!(!Subscription::L4Book { coin: "BTC".into() }.validate(&universe));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn filtered_snapshot_audit_validates_without_reloading() {
+        let (_, _, _, after) = mixed_market_fixture();
+        let app = axum::Router::new().route(
+            "/info",
+            axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+                let after = after.clone();
+                async move {
+                    tokio::fs::write(request["outPath"].as_str().unwrap(), after).await.unwrap();
+                    axum::Json(serde_json::json!({}))
+                }
+            }),
+        );
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/info", socket.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(socket, app).await.unwrap();
+        });
+        for scope in [CoinScope::default(), CoinScope::all()] {
+            let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+            let mut listener = mixed_market_listener(&scope).unwrap();
+            listener.internal_message_tx = Some(tx);
+            let listener = Arc::new(Mutex::new(listener));
+            fetch_snapshot(std::env::temp_dir(), listener.clone(), url.clone()).await.unwrap();
+            let state = listener.lock().await;
+            assert!(state.is_ready(), "{}", scope.describe());
+            assert_eq!(state.stats.snapshot_reloads, 0, "{:?}", state.stats.last_snapshot_reload_reason);
+            assert_eq!(state.stats.empty_book_refreshes, 0);
+            assert_eq!(state.stats.source_gaps, 0);
+            assert!(rx.try_recv().is_err(), "a passing audit must not publish a gap or snapshot");
+        }
+        server.abort();
+        let _unused = server.await;
+    }
+
+    #[test]
+    #[ignore = "manual resource benchmark; run with --release --ignored --nocapture"]
+    fn benchmark_hip4_scope() {
+        fn rss_mib() -> u64 {
+            std::fs::read_to_string("/proc/self/statm")
+                .ok()
+                .and_then(|statm| statm.split_whitespace().nth(1)?.parse::<u64>().ok())
+                .map_or(0, |pages| pages * 4096 / (1024 * 1024))
+        }
+        // Synthetic mainnet-like shape: 400 large books, 200 small HIP-4 books.
+        let mut books = Vec::new();
+        let mut oid = 0;
+        for (coins, prefix, orders) in [(400, "C", 2500), (200, "#", 20)] {
+            for coin in 0..coins {
+                let coin = format!("{prefix}{coin}0");
+                let mut bids = Vec::new();
+                for level in 0..orders {
+                    oid += 1;
+                    bids.push(scoped_order(&coin, oid, "B", &format!("{}.0", 100_000 - level), "1.0"));
+                }
+                books.push(scoped_book(&coin, &bids, &[]));
+            }
+        }
+        let snapshot = serde_json::json!([100, books]).to_string();
+        let open = |order: serde_json::Value| serde_json::json!({"time":"2026-09-11T00:00:01", "user":Address::ZERO, "status":"open", "order":order});
+        // Alternate blocks: 5,000 resting orders open, then are removed (1% HIP-4).
+        let coin_of =
+            |index: u64| if index % 100 == 0 { format!("#{}0", index % 200) } else { format!("C{}0", index % 400) };
+        let mut blocks = Vec::new();
+        for height in 101..=140_u64 {
+            let (statuses, diffs): (Vec<_>, Vec<_>) = (0..5000_u64)
+                .map(|index| {
+                    let coin = coin_of(index);
+                    let oid = 10_000_000 + index;
+                    let diff = |raw: serde_json::Value| {
+                        serde_json::json!({"user":Address::ZERO, "oid":oid, "px":"200000.0", "coin":coin, "raw_book_diff":raw})
+                    };
+                    if height % 2 == 1 {
+                        (Some(open(scoped_order(&coin, oid, "A", "200000.0", "1.0"))), diff(serde_json::json!({"new":{"sz":"1.0"}})))
+                    } else {
+                        (None, diff(serde_json::json!("remove")))
+                    }
+                })
+                .unzip();
+            let statuses: Vec<_> = statuses.into_iter().flatten().collect();
+            blocks.push((
+                scoped_block(height, serde_json::json!(statuses)),
+                scoped_block(height, serde_json::json!(diffs)),
+            ));
+        }
+        println!("snapshot {} MiB, open-block statuses {} KiB", snapshot.len() >> 20, blocks[0].0.len() >> 10);
+        for scope in [CoinScope::all(), CoinScope::default()] {
+            let baseline = rss_mib();
+            let (tx, _rx) = tokio::sync::broadcast::channel(1024);
+            let mut listener = OrderBookListener::new(Some(tx), true, scope.clone());
+            let started = std::time::Instant::now();
+            let (height, parsed) =
+                load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&snapshot, &scope).unwrap();
+            let load = started.elapsed();
+            listener.finish_snapshot(listener.recovery_epoch, None, parsed, height).unwrap();
+            let started = std::time::Instant::now();
+            std::hint::black_box(listener.compute_l2_snapshot());
+            let l2 = started.elapsed();
+            let resident = rss_mib().saturating_sub(baseline);
+            let started = std::time::Instant::now();
+            let audit = listener.clone_state().unwrap().compute_snapshot();
+            let audit_time = started.elapsed();
+            drop(audit);
+            let started = std::time::Instant::now();
+            for (statuses, diffs) in &blocks {
+                listener.process_data(statuses.clone(), EventSource::OrderStatuses).unwrap();
+                listener.process_data(diffs.clone(), EventSource::OrderDiffs).unwrap();
+            }
+            let per_block = started.elapsed() / blocks.len() as u32;
+            assert_eq!(listener.order_book_state.as_ref().unwrap().height(), 140);
+            println!(
+                "scope={} books={} snapshot_load={load:?} initial_l2={l2:?} audit_clone+snapshot={audit_time:?} \
+                 per_block(parse+apply+l2+publish)={per_block:?} book_rss={resident}MiB",
+                scope.describe(),
+                listener.order_book_state.as_ref().unwrap().book_count(),
+            );
+        }
+    }
+
+    #[test]
+    fn filtered_snapshot_audit_still_detects_hip4_divergence() -> Result<()> {
+        let scope = CoinScope::default();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let mut listener = mixed_market_listener(&scope)?;
+        listener.internal_message_tx = Some(tx);
+        let (_, _, _, after) = mixed_market_fixture();
+        let diverged = after.replace(r#""sz":"7.0""#, r#""sz":"6.0""#);
+        assert_ne!(diverged, after);
+        let (height, expected) = load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&diverged, &scope)?;
+        listener.finish_snapshot(listener.recovery_epoch, listener.clone_state(), expected, height)?;
+        assert_eq!(listener.stats.snapshot_reloads, 1);
+        assert!(listener.stats.last_snapshot_reload_reason.as_ref().unwrap().contains("Orders do not match"));
+        assert!(matches!(rx.try_recv().unwrap().as_ref(), InternalMessage::Gap));
+        Ok(())
+    }
+
     #[test]
     fn a_fence_closes_consumers_and_clears_unmatched_work() {
         let (tx, mut rx) = tokio::sync::broadcast::channel(8);
-        let mut listener = OrderBookListener::new(Some(tx), false);
+        let mut listener = OrderBookListener::new(Some(tx), false, CoinScope::all());
         listener.receive_batch(EventBatch::Orders(empty_batch(101))).unwrap();
         listener.fence("test");
         assert!(matches!(rx.try_recv().unwrap().as_ref(), InternalMessage::Gap));
@@ -915,7 +1178,7 @@ mod tests {
     #[test]
     fn fills_are_deduplicated_without_detached_tasks() {
         let (tx, mut rx) = tokio::sync::broadcast::channel(8);
-        let mut listener = OrderBookListener::new(Some(tx), false);
+        let mut listener = OrderBookListener::new(Some(tx), false, CoinScope::all());
         listener.receive_batch(EventBatch::Fills(empty_batch(101))).unwrap();
         listener.receive_batch(EventBatch::Fills(empty_batch(101))).unwrap();
         assert!(matches!(rx.try_recv().unwrap().as_ref(), InternalMessage::Fills { .. }));
@@ -925,7 +1188,7 @@ mod tests {
     #[test]
     fn replayed_pre_snapshot_batches_are_not_published_or_cached() {
         let (tx, mut rx) = tokio::sync::broadcast::channel(8);
-        let mut listener = OrderBookListener::new(Some(tx), false);
+        let mut listener = OrderBookListener::new(Some(tx), false, CoinScope::all());
         listener.order_book_state =
             Some(OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), 100, 1, true, false));
         listener.begin_caching();
@@ -946,7 +1209,7 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(socket, app).await.unwrap();
         });
-        let listener = Arc::new(Mutex::new(OrderBookListener::new(None, false)));
+        let listener = Arc::new(Mutex::new(OrderBookListener::new(None, false, CoinScope::all())));
         {
             let mut state = listener.lock().await;
             state.order_book_state =
@@ -1019,7 +1282,7 @@ mod recovery_integration_tests {
         let server = tokio::spawn(async move {
             axum::serve(socket, app).await.unwrap();
         });
-        let listener = Arc::new(Mutex::new(OrderBookListener::new(None, false)));
+        let listener = Arc::new(Mutex::new(OrderBookListener::new(None, false, CoinScope::all())));
         let limits = ResourceLimits {
             turn_bytes: 128,
             record_bytes: 4096,

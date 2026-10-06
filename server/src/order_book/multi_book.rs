@@ -1,11 +1,16 @@
 use crate::{
     order_book::{Coin, InnerOrder, Oid, OrderBook, Snapshot, Sz},
     prelude::*,
+    types::subscription::CoinScope,
 };
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, DeserializeSeed, IgnoredAny, SeqAccess, Visitor},
+};
 use std::{
     collections::{BTreeMap, HashMap},
+    marker::PhantomData,
     path::Path,
 };
 use tokio::fs::read_to_string;
@@ -70,13 +75,14 @@ impl<O: Send + Sync + InnerOrder> OrderBooks<O> {
     }
 }
 
-pub(crate) fn load_snapshots_from_str<O, R>(str: &str) -> Result<(u64, Snapshots<O>)>
+pub(crate) fn load_snapshots_from_str<O, R>(str: &str, scope: &CoinScope) -> Result<(u64, Snapshots<O>)>
 where
     O: TryFrom<R, Error = Error>,
     R: Serialize + for<'a> Deserialize<'a>,
 {
-    #[allow(clippy::type_complexity)]
-    let (height, snapshot): (u64, Vec<(String, [Vec<R>; 2])>) = serde_json::from_str(str)?;
+    let mut deserializer = serde_json::Deserializer::from_str(str);
+    let (height, snapshot) = SnapshotSeed::<R> { scope, raw: PhantomData }.deserialize(&mut deserializer)?;
+    deserializer.end()?;
     Ok((
         height,
         Snapshots::new(
@@ -92,13 +98,114 @@ where
     ))
 }
 
-pub(crate) async fn load_snapshots_from_json<O, R>(path: &Path) -> Result<(u64, Snapshots<O>)>
+pub(crate) async fn load_snapshots_from_json<O, R>(path: &Path, scope: &CoinScope) -> Result<(u64, Snapshots<O>)>
 where
     O: TryFrom<R, Error = Error>,
     R: Serialize + for<'a> Deserialize<'a>,
 {
     let file_contents = read_to_string(path).await?;
-    load_snapshots_from_str(&file_contents)
+    load_snapshots_from_str(&file_contents, scope)
+}
+
+type RawBook<R> = (String, [Vec<R>; 2]);
+
+/// `[height, [[coin, [bids, asks]], ...]]`. Out-of-scope books are skipped by
+/// the parser instead of being materialised as orders.
+struct SnapshotSeed<'s, R> {
+    scope: &'s CoinScope,
+    raw: PhantomData<R>,
+}
+
+impl<'de, R: Deserialize<'de>> DeserializeSeed<'de> for SnapshotSeed<'_, R> {
+    type Value = (u64, Vec<RawBook<R>>);
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de, R: Deserialize<'de>> Visitor<'de> for SnapshotSeed<'_, R> {
+    type Value = (u64, Vec<RawBook<R>>);
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[height, books]")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+        let height = seq.next_element()?.ok_or_else(|| de::Error::invalid_length(0, &self))?;
+        let books = seq
+            .next_element_seed(BooksSeed::<R> { scope: self.scope, raw: PhantomData })?
+            .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+        if seq.next_element::<IgnoredAny>()?.is_some() {
+            return Err(de::Error::invalid_length(3, &self));
+        }
+        Ok((height, books))
+    }
+}
+
+struct BooksSeed<'s, R> {
+    scope: &'s CoinScope,
+    raw: PhantomData<R>,
+}
+
+impl<'de, R: Deserialize<'de>> DeserializeSeed<'de> for BooksSeed<'_, R> {
+    type Value = Vec<RawBook<R>>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de, R: Deserialize<'de>> Visitor<'de> for BooksSeed<'_, R> {
+    type Value = Vec<RawBook<R>>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a list of [coin, [bids, asks]]")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+        let mut books = Vec::new();
+        while let Some(book) = seq.next_element_seed(BookSeed::<R> { scope: self.scope, raw: PhantomData })? {
+            books.extend(book);
+        }
+        Ok(books)
+    }
+}
+
+struct BookSeed<'s, R> {
+    scope: &'s CoinScope,
+    raw: PhantomData<R>,
+}
+
+impl<'de, R: Deserialize<'de>> DeserializeSeed<'de> for BookSeed<'_, R> {
+    type Value = Option<RawBook<R>>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de, R: Deserialize<'de>> Visitor<'de> for BookSeed<'_, R> {
+    type Value = Option<RawBook<R>>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[coin, [bids, asks]]")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error> {
+        let coin: String = seq.next_element()?.ok_or_else(|| de::Error::invalid_length(0, &self))?;
+        let book = if self.scope.contains(&coin) {
+            let sides: [Vec<R>; 2] = seq.next_element()?.ok_or_else(|| de::Error::invalid_length(1, &self))?;
+            Some((coin, sides))
+        } else {
+            seq.next_element::<IgnoredAny>()?.ok_or_else(|| de::Error::invalid_length(1, &self))?;
+            None
+        };
+        if seq.next_element::<IgnoredAny>()?.is_some() {
+            return Err(de::Error::invalid_length(3, &self));
+        }
+        Ok(book)
+    }
 }
 
 #[cfg(test)]
@@ -113,6 +220,7 @@ mod tests {
         types::{
             L4Order, Level,
             inner::{InnerL4Order, InnerLevel},
+            subscription::CoinScope,
         },
     };
     use alloy::primitives::Address;
@@ -277,16 +385,51 @@ mod tests {
     async fn test_deserialization_from_json() -> Result<()> {
         create_dir_all("tmp/deserialization_test")?;
         fs::write("tmp/deserialization_test/out.json", SNAPSHOT_JSON)?;
-        load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&PathBuf::from(
-            "tmp/deserialization_test/out.json",
-        ))
+        load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(
+            &PathBuf::from("tmp/deserialization_test/out.json"),
+            &CoinScope::all(),
+        )
         .await?;
         Ok(())
     }
 
     #[test]
     fn test_deserialization() -> Result<()> {
-        load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(SNAPSHOT_JSON)?;
+        load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(SNAPSHOT_JSON, &CoinScope::all())?;
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_snapshot_skips_out_of_scope_books_without_materialising_orders() -> Result<()> {
+        // Out-of-scope books may contain anything JSON-valid; they are never parsed as orders.
+        let hip4_order = r##"{"coin":"#10","side":"B","limitPx":"0.5","sz":"1.0","oid":7,"timestamp":0,
+            "triggerCondition":"N/A","isTrigger":false,"triggerPx":"0.0","isPositionTpsl":false,
+            "reduceOnly":false,"orderType":"Limit","tif":"Gtc","cloid":null}"##;
+        let json = format!(
+            r##"[42, [["BTC", [[["not-an-address", {{"oid": "x"}}]], []]],
+                     ["#10", [[["0x0000000000000000000000000000000000000000", {hip4_order}]], []]],
+                     ["#11", [[], []]],
+                     ["@1", [[], [{{"nested": [1, 2, {{"a": null}}]}}]]]]]"##
+        );
+        let (height, snapshots) =
+            load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&json, &CoinScope::default())?;
+        assert_eq!(height, 42);
+        let mut coins: Vec<_> = snapshots.as_ref().keys().map(Coin::value).collect();
+        coins.sort();
+        assert_eq!(coins, ["#10", "#11"]);
+        assert_eq!(snapshots.as_ref()[&Coin::new("#10")].as_ref()[0][0].oid, 7);
+        assert!(load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&json, &CoinScope::all()).is_err());
+
+        let in_scope =
+            load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(SNAPSHOT_JSON, &CoinScope::default())?;
+        assert!(in_scope.1.as_ref().is_empty());
+        // Structural errors are still rejected even when every book is skipped.
+        for malformed in ["[1]", r#"[1, [["BTC"]]]"#, r#"[1, [["BTC", [[], []], 3]]]"#, "[1, [], 2]", "[1, []] x"] {
+            assert!(
+                load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(malformed, &CoinScope::default()).is_err(),
+                "{malformed}"
+            );
+        }
         Ok(())
     }
 
