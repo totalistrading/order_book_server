@@ -61,6 +61,10 @@ impl OrderBookState {
         }
     }
 
+    pub(super) fn book_count(&self) -> usize {
+        self.order_book.as_ref().len()
+    }
+
     pub(super) fn compute_universe(&self) -> HashSet<Coin> {
         self.order_book.as_ref().keys().cloned().collect()
     }
@@ -141,7 +145,7 @@ impl OrderBookState {
 mod tests {
     use super::*;
     use crate::order_book::multi_book::load_snapshots_from_str;
-    use crate::types::L4Order;
+    use crate::types::{L4Order, subscription::CoinScope};
     use alloy::primitives::Address;
     use std::sync::Arc;
 
@@ -149,6 +153,7 @@ mod tests {
     fn cached_views_preserve_published_values_and_advance_quiet_heights() {
         let (_, snapshot) = load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(
             r#"[100, [["BTC", [[], []]], ["ETH", [[], []]]]]"#,
+            &CoinScope::all(),
         )
         .unwrap();
         let mut state = OrderBookState::from_snapshot(snapshot, 100, 1000, true, false);
@@ -183,8 +188,11 @@ mod tests {
                 serde_json::from_value(fixture["book_diffs"].clone()).unwrap(),
             )
             .unwrap();
-        let (_, expected) =
-            load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(&fixture["snapshot"].to_string()).unwrap();
+        let (_, expected) = load_snapshots_from_str::<InnerL4Order, (Address, L4Order)>(
+            &fixture["snapshot"].to_string(),
+            &CoinScope::all(),
+        )
+        .unwrap();
         let actual = state.compute_snapshot();
         super::super::utils::validate_snapshot_consistency(&actual.snapshot, &expected, false).unwrap();
         let (_, _, l2) = state.compute_l2_snapshot();

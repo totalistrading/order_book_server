@@ -9,8 +9,8 @@ use crate::{
         L2Book, L4Book, L4BookUpdates, L4Order, Trade,
         node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
         subscription::{
-            ClientMessage, DEFAULT_LEVELS, MAX_SUBSCRIPTIONS, ServerResponse, Subscription, SubscriptionManager,
-            is_hip4_coin,
+            ClientMessage, CoinScope, DEFAULT_LEVELS, MAX_SUBSCRIPTIONS, ServerResponse, Subscription,
+            SubscriptionManager, is_hip4_coin,
         },
     },
 };
@@ -41,9 +41,13 @@ pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_
 
     // Central task: listen to messages and forward them for distribution
     let home_dir = home_dir().ok_or("Could not find home directory")?;
+    // Out-of-scope coins have no book, so subscriptions to them are rejected
+    // exactly like unknown coins ("Invalid subscription: ...").
+    let scope = CoinScope::from_env()?;
+    info!("Maintaining books for coin scope: {}", scope.describe());
     let listener = {
         let internal_message_tx = internal_message_tx.clone();
-        OrderBookListener::new(Some(internal_message_tx), ignore_spot)
+        OrderBookListener::new(Some(internal_message_tx), ignore_spot, scope)
     };
     let listener = Arc::new(Mutex::new(listener));
     {

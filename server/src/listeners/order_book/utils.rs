@@ -316,7 +316,7 @@ mod queue_limit_tests {
 #[cfg(test)]
 mod consistency_tests {
     use super::*;
-    use crate::order_book::multi_book::load_snapshots_from_str;
+    use crate::{order_book::multi_book::load_snapshots_from_str, types::subscription::CoinScope};
 
     #[derive(Clone, Debug, PartialEq)]
     struct Order(u64);
@@ -327,7 +327,7 @@ mod consistency_tests {
         }
     }
     fn snapshot(json: &str) -> Snapshots<Order> {
-        load_snapshots_from_str::<Order, u64>(json).unwrap().1
+        load_snapshots_from_str::<Order, u64>(json, &CoinScope::all()).unwrap().1
     }
 
     #[test]
